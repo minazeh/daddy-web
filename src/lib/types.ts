@@ -28,6 +28,10 @@ export const GUILD_LABEL: Record<Guild, string> = {
 
 // Mirrors the `members` doc written by the Discord bot.
 // (`_id` is omitted — we never expose Mongo ObjectIds to the client.)
+// `power` is NOT from the bot's `members` collection — it lives in the
+// web-owned `memberMeta`. It's joined in at read time (the builder page enriches
+// members via getPowerMap); default 0 when unrated. Optional so plain reads that
+// don't need power can omit it.
 export interface Member {
   userId: string;
   username: string;
@@ -38,6 +42,7 @@ export interface Member {
   className: string | null;
   classRoleId: string | null;
   updatedAt: string; // ISO string (serialized from Mongo Date)
+  power?: number; // joined from memberMeta (default 0 when unrated)
 }
 
 // Web-owned `memberMeta` collection — the source of truth for manual POWER

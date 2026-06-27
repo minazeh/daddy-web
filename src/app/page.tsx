@@ -1,4 +1,4 @@
-import { getMembers, getParties } from "@/lib/data";
+import { getMembers, getParties, getPowerMap } from "@/lib/data";
 import { isMongoConfigured } from "@/lib/mongo";
 import { BuilderShell } from "@/components/BuilderShell";
 import { DEFAULT_GUILD, isGuild, type Guild } from "@/lib/types";
@@ -22,11 +22,18 @@ export default async function DashboardPage({
   const { guild: guildParam } = await searchParams;
   const guild: Guild = isGuild(guildParam) ? guildParam : DEFAULT_GUILD;
 
-  // Scoped to the selected guild only — never both.
-  const [members, parties] = await Promise.all([
+  // Scoped to the selected guild only — never both. Power lives in the
+  // web-owned memberMeta (not the bot's `members`), so we join it in here:
+  // enrich each member with their power (default 0 when unrated) for the chips.
+  const [rawMembers, parties, powerMap] = await Promise.all([
     getMembers(guild),
     getParties(guild),
+    getPowerMap(guild),
   ]);
+  const members = rawMembers.map((m) => ({
+    ...m,
+    power: powerMap.get(m.userId) ?? 0,
+  }));
 
   return (
     // `key={guild}` forces a fresh shell per guild so no client state ever

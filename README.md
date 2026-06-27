@@ -7,13 +7,24 @@ via drag-and-drop.
 are entirely independent and are never shown together. The app displays exactly
 **one guild at a time**, with a **Daddy ⇄ Mummy toggle** (defaults to Daddy).
 
+## Navigation
+
+A shared **top nav** (`TopNav`) appears on all three pages with three items —
+**Party Setup** (`/`), **Raid Setup** (`/raids`), **Member Dashboard**
+(`/members`) — plus the right-aligned **Daddy ⇄ Mummy toggle**. Every nav link
+carries `?guild=${guild}`, so switching pages keeps the current guild; the
+active page is highlighted. `active` is passed as a prop by each page shell (no
+client hooks) so it's SSR-safe / hydration-clean. The toggle stays on the
+current page.
+
 ## Layout
 
 A full-width, full-height two-pane builder (no centered container):
 
 - **Left — member panel** (~300px, sticky, scrollable): the selected guild's
-  member pool as compact draggable cards (name + class pill + MAIN/SUB badge).
-  The Daddy ⇄ Mummy toggle lives at the top of this panel.
+  member pool as compact draggable cards (name + class pill + **⚡power**). The
+  power comes from the web-owned `memberMeta` (joined in by the page; ⚡0 when
+  unrated). No MAIN/SUB badge — the builder is already per-guild.
 - **Right — vertically-scrollable board** (`overflow-y-auto`, no zoom/pan, no
   horizontal scroll): each guild has a **FIXED, pre-created field structure**
   laid out in a deterministic grid (5 cards per row). You scroll down through:
@@ -26,13 +37,24 @@ A full-width, full-height two-pane builder (no centered container):
 
 Each **party card** (dark blue/purple neon) has a header (name + member count),
 5 slots, and per-slot controls. A filled slot shows the member's name, class
-pill, a MAIN/SUB badge, a **lock** toggle, and an **X** remove button. Empty
-slots show a "drop here" placeholder. A **locked slot can't be overwritten** by
-a drop. (We only have name + class + isMain/isSub — no STR / build-spec / role
-data, and none is invented.)
+pill, **⚡power**, a **lock** toggle, and an **X** remove button. Empty slots
+show a "drop here" placeholder.
 
-**Every slot change auto-saves** — drag assignments, locks, and renames persist
-immediately. There is no manual save button.
+**Drag & drop / swap:**
+- Drag a member from the pool or a slot onto an **empty** slot → they **join**
+  that party (5-slot cap respected; full parties reject an empty-slot join).
+- Drag a member **A** onto an **occupied** unlocked slot holding **B** →
+  **A and B swap**: A takes B's slot (in B's party), B takes A's source slot —
+  or returns to the **pool** if A came from the pool. A swap is net-zero on
+  party sizes, so it **works even when the target party is full**. Both affected
+  parties auto-save.
+- Drop a member back onto the **pool** → removed from its party.
+- **Locks:** a **locked slot is fixed** — it can't be a move/swap *target* (its
+  member can't be displaced), and a **locked member can't be dragged** (it's not
+  draggable). Unlock first to switch a locked member.
+
+**Every slot change auto-saves** — assignments, swaps, locks, and renames
+persist immediately (no manual save button).
 
 ### Roster auto-fill toolbar
 
@@ -40,23 +62,27 @@ A toolbar above the field grid has three buttons, all scoped to the
 **currently-viewed guild** (both its Main + Sub fields). Randomness lives in the
 server actions, so there is no hydration concern.
 
-- **Generate** — auto-assigns the unlocked slots. Locked slots are frozen
-  (preserved). It builds the available pool from this guild's members who are
-  not pinned in a locked slot, clears all unlocked slots, then fills:
-  1. **Hard rule — a Priest in every party:** each party lacking a (locked)
-     Priest gets one from the Priest pool first (highest-power Priest → currently
-     lowest-power party). If Priests run short, it fills as many as it can and
-     shows a **"⚠ No Priest"** badge on the parties left without one.
-  2. **Tank spread:** ~1 Tank (Knight) per party, again highest-power → lowest.
-  3. **Power balance:** remaining members are placed **highest-power-first into
-     the currently-lowest-power party** that has a free slot (a "largest-first
-     into smallest-bin" partition heuristic) — this minimizes the spread of
-     party power sums. Locked members' power counts toward their party from the
-     start. Each member's power comes from `memberMeta` (default 0 when
-     unrated). Equal-power members are shuffled so repeated Generates differ.
-  Generate uses **ACTIVE members only** (present in `members`). No member is
-  placed in two parties; the 5-slot cap is respected; fills stop when the pool
-  is exhausted (later parties may be partial).
+- **Generate** — auto-assigns the unlocked slots, **two-tier and power-aware**.
+  Locked slots are frozen (locked members + locked Priests count toward their
+  party from the start). It builds the available pool (active, unlocked members)
+  and fills:
+  1. **Priest hard rule (power-based, Main-first):** each priestless party gets
+     a Priest sorted by power DESC, **Main parties first, then Sub** — so the
+     strongest non-locked Priests anchor Main. A locked Priest counts as present
+     (not reassigned). Parties left without one get a **"⚠ No Priest"** badge.
+  2. **Tier partition (Main = elite, Sub = the rest):** the remaining members
+     are ranked by power DESC; the top ones fill **Main** (up to Main's free-slot
+     capacity), the rest go to **Sub**. Net effect: Main's pool outpowers Sub's.
+  3. **Per-field balance:** within Main's 12 parties (and separately within Sub's
+     18) — a ~1-Tank pass then a **largest-into-smallest-bin** balance fill from
+     that field's tier pool, so each tier is internally even (not stacked into
+     party 1). **Main is never balanced against Sub** — Main is intentionally
+     stronger.
+  Power comes from `memberMeta` (default 0 unrated). **Randomness applies only to
+  ties** (equal-power members shuffle), so the power-priority ordering is
+  otherwise deterministic — reruns are similar by design (Main consistently gets
+  the best), differing only among equal-power members. Generate uses **ACTIVE
+  members only**; no member in two parties; 5-slot cap respected.
 - **Reset** — clears only the **unlocked** slots (members return to the pool);
   locked members stay pinned; locks unchanged. (Confirm prompt.)
 - **Reset Lock** — clears **everything** for the guild: all assignments **and**
@@ -69,10 +95,9 @@ is generic DPS/flex and never counts as a Priest.
 
 ### Raid Groups page (`/raids`)
 
-The layer **above** parties: **Members → Parties → Raid Groups**. From the
-builder toolbar, **"Manage Raid Groups"** navigates to `/raids` (carrying the
-guild via `?guild=`); `/raids` has a **"← Back to parties"** link. Same
-Daddy⇄Mummy toggle and per-guild scoping, plain vertical scroll (no zoom/pan).
+The layer **above** parties: **Members → Parties → Raid Groups**. Reached via
+the shared top nav (**Raid Setup**). Per-guild scoping, plain vertical scroll
+(no zoom/pan).
 
 For each of **Main Field** and **Sub Field** (stacked, separated by a divider):
 - An **Unassigned** pool of that field's parties not yet in any raid group —
@@ -90,22 +115,42 @@ All raid-group changes auto-save immediately (optimistic UI, no save button).
 
 ### Members page (`/members`)
 
-A dark analytics-style member management dashboard. From the builder toolbar,
-**"Members"** navigates to `/members` (carrying the guild); the page has a
-**"← Back to parties"** link and the Daddy⇄Mummy toggle.
+A dark analytics-style member management dashboard — **two-pane**, like the
+builder. Reached via the shared top nav (**Member Dashboard**). All stats are
+**real data** for the selected guild (no fabricated attendance).
 
-- **Stat cards (real data only):** Active Members, Departed, Avg Power (active,
-  unrated count as 0), and Parties Filled / Members Assigned. An **"Attendance —
-  coming soon"** placeholder is shown but **no attendance numbers are
-  fabricated** (voice-chat tracking is a later phase).
-- **Member grid:** every member (active + departed) with avatar/initial,
-  displayName, class, guild (Main/Sub), and power. **Departed members are greyed
-  out + marked "Left server"** — they are not removed (they also leave the
-  builder pool / Generate automatically via the party prune).
-- **Click a member → modal** with all details (userId, username, displayName,
-  class, classRoleId, guild, status, lastSeen) + an editable **Power Rating**
-  field (non-negative integer, default 0). Save persists to `memberMeta` via the
-  `setMemberPower` server action (optimistic UI).
+**LEFT — member list** (scrollable, ~320px): every member (active + departed)
+as a compact card (avatar/initial, displayName, class, ⚡power). Departed members
+are greyed + marked "Left". A **search box** (by name/class) and a **sort
+control** sit above the list:
+- Sort options: **Name A→Z** (default), **Name Z→A**, **Power high→low**,
+  **Power low→high**. The default is a single deterministic order applied
+  identically on the server + first client render (hydration-safe); changing it
+  re-sorts client-side only. Power sorts break ties by name; name sorts break
+  ties by userId (stable/deterministic).
+Clicking a member opens the **detail + Power Rating modal** (all fields: userId,
+username, displayName, class, classRoleId, guild, status, lastSeen) — power is a
+non-negative integer (default 0), saved to `memberMeta` via `setMemberPower`.
+
+**RIGHT — analytics dashboard** (scrollable), all real, current-guild data
+(active members for stats unless noted):
+- **Roster-health stat cards:** Active, Departed, Avg Power (active, unrated=0),
+  **Priest coverage** (# Priests vs party count, flagged amber if short),
+  Assigned / Bench (in a party vs not, from `parties`), Rated / Unrated
+  (power>0 vs =0).
+- **Per-class table:** one row per class (the 8 + an "Unknown/none" row) with
+  count, avg, min, max, median power, and unrated count; the role column uses
+  `CLASS_ROLE` (Tank/Healer/DPS).
+- **Charts:** members-per-class bar, average-power-per-class bar, power
+  histogram (buckets 0 / 1–25 / 26–50 / 51–75 / 76–100 / 100+), and a role-split
+  (Tank/Healer/DPS) stacked bar.
+- **Lists:** Top 10 by power, and "Needs rating" (active members with power 0).
+- An **"Attendance — coming soon"** placeholder (voice-chat tracking is a later
+  phase) — no fabricated numbers.
+
+**Charts are plain CSS/SVG** with deterministic widths/heights derived from the
+data — **no charting library, no DOM measurement** — so they SSR identically to
+the first client render (zero hydration mismatch; no mounted guard needed).
 
 Guild membership maps to the bot's member flags:
 
@@ -276,8 +321,9 @@ access, Node version, and the two deploy paths: GitHub Git integration or the
 | `src/components/RaidShell.tsx` | Client raid builder: two field sections, each with an unassigned-party pool + raid-group containers; one `DndContext id="raid-dnd"`. |
 | `src/components/RaidGroupCard.tsx` | Droppable raid group: editable name, delete, holds party chips. |
 | `src/components/PartyChip.tsx` | Draggable party chip (name + member count + no-Priest ⚠). |
-| `src/components/MemberPool.tsx` | Left sidebar (toggle + draggable member pool, also a drop target). |
+| `src/components/MemberPool.tsx` | Left sidebar (draggable member pool, also a drop target). |
 | `src/components/PartyCard.tsx` | Neon party card: renameable header, 5 slots, lock + remove. |
-| `src/components/MemberChip.tsx` | Draggable member card + MAIN/SUB badge. |
-| `src/components/GuildToggle.tsx` | Daddy ⇄ Mummy switcher (links to `/?guild=...` or `/raids?guild=...`). |
+| `src/components/MemberChip.tsx` | Draggable member card (name + class + ⚡power). |
+| `src/components/TopNav.tsx` | Shared top nav (Party/Raid/Member + guild toggle) on all 3 pages. |
+| `src/components/GuildToggle.tsx` | Daddy ⇄ Mummy switcher (`basePath` keeps you on the current page). |
 | `src/components/PartyBoard.tsx` | Deprecated shim → re-exports `BuilderShell`. |

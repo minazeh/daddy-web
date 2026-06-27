@@ -111,6 +111,7 @@ function shuffle<T>(arr: T[]): T[] {
 // indexes are the ones we (re)fill.
 interface PartyPlan {
   partyId: string;
+  field: Field; // "main" (elite tier) | "sub" — Main is staffed first
   slots: (string | null)[]; // length MAX_PARTY_SLOTS; userId or null
   locked: Set<number>;
   // True if the party already contains a Priest among its RETAINED members
@@ -158,44 +159,38 @@ function buildPlans(parties: Party[], memberById: Map<string, Member>): PartyPla
     const hasPriest = slots.some(
       (uid) => uid !== null && isHealer(memberById.get(uid)?.className ?? null),
     );
-    return { partyId: p.partyId, slots, locked, hasPriest };
+    return { partyId: p.partyId, field: p.field, slots, locked, hasPriest };
   });
 }
 
-// Core generation over a set of parties + the available member pool, POWER-AWARE.
+// Core generation — POWER-AWARE, TWO-TIER (Main = elite, Sub = the rest).
 // Mutates plans' slots. Returns the set of partyIds left WITHOUT a healer.
 //
-// Heuristic (after the Priest hard rule + respecting locks):
-//   - Each party's running power = sum of power of its current members
-//     (LOCKED members' power counts toward their party from the start).
-//   - PASS 1 (Priests): assign each priestless party a Priest, giving the
-//     HIGHEST-power available Priest to the currently-LOWEST-power party first.
-//   - PASS 2 (Tank spread): give ~1 Tank per party that has none, again
-//     highest-power tank → lowest-power party.
-//   - PASS 3 (balance fill): repeatedly take the HIGHEST-power remaining member
-//     and place it into the currently-LOWEST-power party that still has a free
-//     slot. This greedy "largest-first into smallest-bin" minimizes the spread
-//     of party power sums (a standard multiway-partition heuristic).
-// Members of equal power are shuffled so repeated Generates differ.
+// Rules (after locks; locked members + locked Priests are fixed and count
+// toward their party from the start):
+//   1. PRIEST hard rule, power-based + Main-first: priestless parties get a
+//      Priest, sorted by power DESC, MAIN parties first then SUB — so the
+//      strongest non-locked Priests anchor Main. A LOCKED Priest counts as
+//      present and is not reassigned. Parties left without one are flagged.
+//   2. TIER PARTITION: rank the remaining available members by power DESC and
+//      give the top ones to MAIN (up to Main's remaining free-slot capacity);
+//      the rest go to SUB. Net: Main's pool outpowers Sub's.
+//   3. PER-FIELD BALANCE: within Main's parties (and separately within Sub's),
+//      do a ~1-tank pass then a largest-into-smallest-bin balance fill from that
+//      field's tier pool — so each tier is internally even, NOT stacked into
+//      party 1. Main is never balanced against Sub (Main is intentionally
+//      stronger).
+// Randomness applies ONLY to ties (equal-power members shuffle); the
+// power-priority ordering is otherwise deterministic, so reruns are similar by
+// design (Main consistently gets the best).
 function generatePlans(
   plans: PartyPlan[],
   pool: Member[],
   powerOf: (uid: string) => number,
 ): Set<string> {
-  // Sort a member list by power DESC, ties broken randomly (shuffle then sort
-  // is stable enough given we re-shuffle equal-power runs implicitly).
+  // Sort by power DESC; equal-power runs shuffled (ties only).
   const byPowerDesc = (list: Member[]) =>
     shuffle(list.slice()).sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
-
-  const healers = byPowerDesc(pool.filter((m) => isHealer(m.className)));
-  const tanks = byPowerDesc(
-    pool.filter((m) => roleForClass(m.className) === "tank"),
-  );
-  const dps = byPowerDesc(
-    pool.filter(
-      (m) => !isHealer(m.className) && roleForClass(m.className) !== "tank",
-    ),
-  );
 
   const used = new Set<string>();
   const freeSlots = (plan: PartyPlan): number[] => {
@@ -205,14 +200,14 @@ function generatePlans(
     }
     return out;
   };
-  const place = (plan: PartyPlan, uid: string): boolean => {
+  const place = (plan: PartyPlan, uid: string) => {
     const free = freeSlots(plan);
     if (free.length === 0) return false;
     plan.slots[free[0]] = uid;
     return true;
   };
 
-  // Running power sum per party (seed with locked/existing members' power).
+  // Running power per party (seeded with locked/existing members).
   const power = new Map<string, number>();
   for (const plan of plans) {
     let sum = 0;
@@ -222,18 +217,22 @@ function generatePlans(
   const addPower = (plan: PartyPlan, uid: string) =>
     power.set(plan.partyId, (power.get(plan.partyId) ?? 0) + powerOf(uid));
 
-  // The party with the lowest running power that still has a free slot (and,
-  // optionally, passes a predicate). Ties broken by partyId for determinism.
-  const lowestOpen = (pred?: (p: PartyPlan) => boolean): PartyPlan | null => {
+  // Lowest-power open party AMONG a given subset (a single field's plans).
+  // Ties broken by partyId for determinism.
+  const lowestOpenIn = (
+    subset: PartyPlan[],
+    pred?: (p: PartyPlan) => boolean,
+  ): PartyPlan | null => {
     let best: PartyPlan | null = null;
-    for (const plan of plans) {
+    for (const plan of subset) {
       if (freeSlots(plan).length === 0) continue;
       if (pred && !pred(plan)) continue;
+      const pp = power.get(plan.partyId) ?? 0;
+      const bp = best ? (power.get(best.partyId) ?? 0) : 0;
       if (
         best === null ||
-        (power.get(plan.partyId) ?? 0) < (power.get(best.partyId) ?? 0) ||
-        ((power.get(plan.partyId) ?? 0) === (power.get(best.partyId) ?? 0) &&
-          plan.partyId.localeCompare(best.partyId) < 0)
+        pp < bp ||
+        (pp === bp && plan.partyId.localeCompare(best.partyId) < 0)
       ) {
         best = plan;
       }
@@ -242,7 +241,7 @@ function generatePlans(
   };
   const takeNext = (list: Member[]): Member | null => {
     while (list.length) {
-      const m = list.shift()!; // highest power first (sorted desc)
+      const m = list.shift()!;
       if (!used.has(m.userId)) {
         used.add(m.userId);
         return m;
@@ -251,49 +250,77 @@ function generatePlans(
     return null;
   };
 
+  const mainPlans = plans.filter((p) => p.field === "main");
+  const subPlans = plans.filter((p) => p.field === "sub");
   const noHealer = new Set<string>();
 
-  // PASS 1 — HARD RULE: a Priest in every party that doesn't already have one.
-  // Highest-power Priest → currently-lowest-power priestless party.
-  const needPriest = plans.filter((p) => !p.hasPriest);
-  for (let k = 0; k < needPriest.length; k++) {
-    const target = lowestOpen((p) => !p.hasPriest && freeSlots(p).length > 0);
-    if (!target) break;
-    const h = takeNext(healers);
-    if (!h) break;
-    place(target, h.userId);
-    addPower(target, h.userId);
-    target.hasPriest = true;
-  }
-  // Any priestless party we couldn't satisfy gets flagged.
+  // ---- STEP 1: PRIEST hard rule, power DESC, MAIN parties first then SUB. ----
+  const healers = byPowerDesc(pool.filter((m) => isHealer(m.className)));
+  const assignPriests = (subset: PartyPlan[]) => {
+    const need = subset.filter((p) => !p.hasPriest).length;
+    for (let k = 0; k < need; k++) {
+      const target = lowestOpenIn(
+        subset,
+        (p) => !p.hasPriest && freeSlots(p).length > 0,
+      );
+      if (!target) break;
+      const h = takeNext(healers); // strongest remaining Priest
+      if (!h) break;
+      place(target, h.userId);
+      addPower(target, h.userId);
+      target.hasPriest = true;
+    }
+  };
+  assignPriests(mainPlans); // Main anchored first by the strongest Priests
+  assignPriests(subPlans);
   for (const plan of plans) if (!plan.hasPriest) noHealer.add(plan.partyId);
 
-  // PASS 2 — TANK SPREAD: ~1 Tank per party lacking one, highest-power tank →
-  // lowest-power party. (We don't track tank-presence precisely; one pass that
-  // hands a tank to each lowest-power open party is enough for a rough spread.)
-  for (let k = 0; k < plans.length && tanks.some((t) => !used.has(t.userId)); k++) {
-    const target = lowestOpen();
-    if (!target) break;
-    const t = takeNext(tanks);
-    if (!t) break;
-    place(target, t.userId);
-    addPower(target, t.userId);
-  }
+  // ---- STEP 2: TIER PARTITION of the remaining (non-priest-assigned) pool. ----
+  // Highest-power remainder fills MAIN up to its free capacity; rest → SUB.
+  const remaining = byPowerDesc(pool.filter((m) => !used.has(m.userId)));
+  const mainCapacity = mainPlans.reduce((s, p) => s + freeSlots(p).length, 0);
+  const mainPool = remaining.slice(0, mainCapacity);
+  const subPool = remaining.slice(mainCapacity);
 
-  // PASS 3 — BALANCE FILL: highest-power remaining member → lowest-power open
-  // party, until everyone is placed or all slots are full. Merge leftover
-  // dps/tanks/healers and always pull the globally highest-power unused one.
-  const remaining = [...dps, ...tanks, ...healers]
-    .filter((m) => !used.has(m.userId))
-    .sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
-  for (const m of remaining) {
-    if (used.has(m.userId)) continue;
-    const target = lowestOpen();
-    if (!target) break; // no free slots anywhere
-    used.add(m.userId);
-    place(target, m.userId);
-    addPower(target, m.userId);
-  }
+  // ---- STEP 3: per-field fill — ~1 tank pass, then balance fill. ----
+  const fillField = (subset: PartyPlan[], fieldPool: Member[]) => {
+    const localUsed = new Set<string>();
+    const take = (pred: (m: Member) => boolean): Member | null => {
+      for (let i = 0; i < fieldPool.length; i++) {
+        const m = fieldPool[i];
+        if (localUsed.has(m.userId) || used.has(m.userId)) continue;
+        if (!pred(m)) continue;
+        localUsed.add(m.userId);
+        used.add(m.userId);
+        return m;
+      }
+      return null;
+    };
+
+    // Tank spread: ~1 tank into each lowest-power open party (within field).
+    for (let k = 0; k < subset.length; k++) {
+      const target = lowestOpenIn(subset);
+      if (!target) break;
+      const t = take((m) => roleForClass(m.className) === "tank");
+      if (!t) break;
+      place(target, t.userId);
+      addPower(target, t.userId);
+    }
+
+    // Balance fill: strongest remaining (this field's pool) → lowest-power open
+    // party in this field. Largest-into-smallest-bin keeps the tier even.
+    for (const m of fieldPool) {
+      if (localUsed.has(m.userId) || used.has(m.userId)) continue;
+      const target = lowestOpenIn(subset);
+      if (!target) break; // no free slots left in this field
+      localUsed.add(m.userId);
+      used.add(m.userId);
+      place(target, m.userId);
+      addPower(target, m.userId);
+    }
+  };
+  fillField(mainPlans, mainPool);
+  fillField(subPlans, subPool);
 
   return noHealer;
 }

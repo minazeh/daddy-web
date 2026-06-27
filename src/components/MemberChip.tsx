@@ -14,46 +14,37 @@ export interface DragData {
   from: string; // "pool" | partyId
 }
 
-export function GuildBadge({ member }: { member: Member }) {
-  // We only have isMain (Daddy) / isSub (Mummy) — no role/power data.
-  const label = member.isMain ? "MAIN" : member.isSub ? "SUB" : "—";
-  const tone = member.isMain
-    ? "bg-sky-500/20 text-sky-300 ring-sky-400/40"
-    : "bg-fuchsia-500/20 text-fuchsia-300 ring-fuchsia-400/40";
-  return (
-    <span
-      className={`rounded px-1 py-px text-[9px] font-bold tracking-wide ring-1 ${tone}`}
-    >
-      {label}
-    </span>
-  );
-}
-
 export function MemberChip({
   member,
   instanceId,
   from,
   overlay = false,
   compact = false,
+  locked = false,
 }: {
   member: Member;
   instanceId: string;
   from: string;
   overlay?: boolean;
   compact?: boolean;
+  // A locked member is FIXED: not draggable (can't be dragged out, can't be a
+  // swap source). dnd-kit's `disabled` removes the listeners entirely.
+  locked?: boolean;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: instanceId,
     data: { kind: "member", memberId: member.userId, from } satisfies DragData,
+    disabled: locked,
   });
 
   return (
     <div
       ref={setNodeRef}
-      {...listeners}
-      {...attributes}
+      {...(locked ? {} : listeners)}
+      {...(locked ? {} : attributes)}
       className={[
-        "flex cursor-grab touch-none items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm select-none active:cursor-grabbing",
+        "flex touch-none items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm select-none",
+        locked ? "cursor-default" : "cursor-grab active:cursor-grabbing",
         "border-indigo-400/30 bg-indigo-950/60 text-slate-100 backdrop-blur-sm",
         compact ? "" : "shadow-sm",
         isDragging && !overlay ? "opacity-30" : "",
@@ -80,7 +71,12 @@ export function MemberChip({
               {member.className}
             </span>
           )}
-          <GuildBadge member={member} />
+          {/* Power from memberMeta (joined in by the builder page); ⚡0 when
+              unrated. The Main/Sub badge is intentionally omitted — the builder
+              is already per-guild, so it's redundant. */}
+          <span className="text-[10px] tabular-nums text-slate-300">
+            ⚡{member.power ?? 0}
+          </span>
         </span>
       </span>
     </div>

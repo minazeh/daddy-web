@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { MAX_PARTY_SLOTS, type Member, type Party } from "@/lib/types";
-import { MemberChip, GuildBadge } from "./MemberChip";
+import { MemberChip } from "./MemberChip";
 
 // A party card in the fixed field grid (no free repositioning).
 // - The HEADER shows the (renameable) party name + member count.
@@ -79,6 +79,7 @@ function Slot({
           instanceId={`${partyId}:${member.userId}`}
           from={partyId}
           compact
+          locked={locked}
         />
       ) : (
         <div className="flex items-center justify-center px-2 py-2 text-[11px] text-indigo-300/40">
@@ -193,6 +194,3 @@ export function PartyCard({
     </div>
   );
 }
-
-// Re-export so BuilderShell's DragOverlay can show a member badge if needed.
-export { GuildBadge };

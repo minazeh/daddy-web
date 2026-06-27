@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useMemo, useState, useTransition } from "react";
 import {
   DndContext,
@@ -36,6 +35,7 @@ import {
 import { MemberPool, POOL_ID } from "./MemberPool";
 import { PartyCard } from "./PartyCard";
 import { MemberChip, type DragData } from "./MemberChip";
+import { TopNav } from "./TopNav";
 
 // The interactive builder for ONE guild. Holds all client state (optimistic
 // UI) and orchestrates member drag-and-drop inside a single DndContext. Every
@@ -174,6 +174,12 @@ export function BuilderShell({
     persistMembers(partyId, nextIds);
   }
 
+  // Drop member A (from = pool | partyId) onto slot (toPartyId, slotIndex).
+  //   - target slot LOCKED        -> no-op (can't displace a locked member).
+  //   - target slot OCCUPIED by B -> SWAP A and B (net-zero sizes; works even
+  //                                   when the target party is full).
+  //   - target slot EMPTY         -> move A into the target party (5-cap).
+  // memberIds is compact (no gaps); slotIndex >= length means an empty slot.
   function assignToParty(
     memberId: string,
     from: string,
@@ -183,13 +189,72 @@ export function BuilderShell({
     const target = parties.find((p) => p.partyId === toPartyId);
     if (!target) return;
 
-    // A locked slot can't be overwritten by a drop.
-    if (target.lockedSlots.includes(slotIndex) && target.memberIds[slotIndex]) {
+    // A LOCKED target slot is fixed — can't be a move/swap target.
+    if (target.lockedSlots.includes(slotIndex)) return;
+
+    const occupantB = target.memberIds[slotIndex] ?? null; // null if empty slot
+
+    // ---- SWAP: target slot has an occupant B (and isn't locked) ----
+    if (occupantB && occupantB !== memberId) {
+      // Don't swap INTO a member who is the same as A (handled above), and A's
+      // own source slot, if any, must be unlocked (locked A isn't draggable, so
+      // this is belt-and-suspenders).
+      if (from === "pool") {
+        // A from pool takes B's slot; B is displaced to the pool (removed from
+        // the target party). Net party size unchanged.
+        const toIds = target.memberIds.map((id) =>
+          id === occupantB ? memberId : id,
+        );
+        setParties((prev) =>
+          prev.map((p) =>
+            p.partyId === toPartyId ? { ...p, memberIds: toIds } : p,
+          ),
+        );
+        persistMembers(toPartyId, toIds);
+        return;
+      }
+
+      // A from a party: exchange A and B between `from` and `toPartyId`.
+      const fromParty = parties.find((p) => p.partyId === from);
+      if (!fromParty) return;
+      if (from === toPartyId) {
+        // Same-party swap = reorder (cosmetic). Swap the two indexes.
+        const aIdx = fromParty.memberIds.indexOf(memberId);
+        if (aIdx === -1) return;
+        const ids = [...target.memberIds];
+        [ids[aIdx], ids[slotIndex]] = [ids[slotIndex], ids[aIdx]];
+        setParties((prev) =>
+          prev.map((p) =>
+            p.partyId === toPartyId ? { ...p, memberIds: ids } : p,
+          ),
+        );
+        persistMembers(toPartyId, ids);
+        return;
+      }
+
+      // Cross-party swap: A -> B's slot in toParty; B -> A's slot in fromParty.
+      const toIds = target.memberIds.map((id) =>
+        id === occupantB ? memberId : id,
+      );
+      const fromIds = fromParty.memberIds.map((id) =>
+        id === memberId ? occupantB : id,
+      );
+      setParties((prev) =>
+        prev.map((p) => {
+          if (p.partyId === toPartyId) return { ...p, memberIds: toIds };
+          if (p.partyId === from) return { ...p, memberIds: fromIds };
+          return p;
+        }),
+      );
+      persistMembers(toPartyId, toIds);
+      persistMembers(from, fromIds);
       return;
     }
-    if (from === toPartyId) return; // already in this party
+
+    // ---- MOVE into an EMPTY slot (or member dropped onto its own slot) ----
+    if (from === toPartyId) return; // already in this party (own/empty slot)
     if (target.memberIds.includes(memberId)) return; // dedupe
-    if (target.memberIds.length >= MAX_PARTY_SLOTS) return; // full
+    if (target.memberIds.length >= MAX_PARTY_SLOTS) return; // full, no swap
 
     const toIds = [...target.memberIds, memberId];
     let fromIds: string[] | null = null;
@@ -301,8 +366,10 @@ export function BuilderShell({
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
     >
-      <div className="flex h-screen w-full overflow-hidden">
-        <MemberPool guild={guild} members={members} assignedIds={assignedIds} />
+      <div className="flex h-screen w-full flex-col overflow-hidden">
+        <TopNav guild={guild} active="party" />
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+          <MemberPool guild={guild} members={members} assignedIds={assignedIds} />
 
         {/* RIGHT: vertically-scrollable board (no zoom/pan). */}
         <div className="relative flex-1 overflow-y-auto overflow-x-hidden canvas-grid">
@@ -355,18 +422,6 @@ export function BuilderShell({
                 {noHealerIds.size === 1 ? "party" : "parties"} without a Priest
               </span>
             )}
-            <Link
-              href={`/members?guild=${guild}`}
-              className="ml-auto rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-indigo-100 hover:bg-indigo-900/70"
-            >
-              Members
-            </Link>
-            <Link
-              href={`/raids?guild=${guild}`}
-              className="rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-indigo-100 hover:bg-indigo-900/70"
-            >
-              Manage Raid Groups →
-            </Link>
           </div>
 
           {/* Two stacked field sections: Main Field (12) above, a divider,
@@ -413,6 +468,7 @@ export function BuilderShell({
               </section>
             ))}
           </div>
+        </div>
         </div>
       </div>
 

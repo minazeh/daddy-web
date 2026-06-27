@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useMemo, useState, useTransition } from "react";
 import {
   DndContext,
@@ -17,7 +16,6 @@ import {
 import {
   FIELDS,
   FIELD_LABEL,
-  GUILD_LABEL,
   partyHasPriest,
   type Field,
   type Guild,
@@ -32,9 +30,9 @@ import {
   removePartyFromRaid,
   renameRaidGroup,
 } from "@/lib/actions";
-import { GuildToggle } from "./GuildToggle";
 import { PartyChip, type PartyDragData } from "./PartyChip";
 import { RaidGroupCard } from "./RaidGroupCard";
+import { TopNav } from "./TopNav";
 
 // The Raid Groups builder for ONE guild: drag PARTIES into raid groups. Scoped
 // per guild AND per field (Main raid groups hold Main parties, Sub holds Sub —
@@ -235,22 +233,7 @@ export function RaidShell({
       onDragEnd={handleDragEnd}
     >
       <div className="flex h-screen w-full flex-col overflow-hidden">
-        {/* Top bar */}
-        <div className="flex flex-wrap items-center gap-3 border-b border-indigo-500/20 bg-[#0c0c1c]/90 px-6 py-2">
-          <Link
-            href={`/?guild=${guild}`}
-            className="rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-indigo-100 hover:bg-indigo-900/70"
-          >
-            ← Back to parties
-          </Link>
-          <span className="text-base font-bold text-slate-100">Raid Groups</span>
-          <span className="text-xs text-slate-400">
-            {GUILD_LABEL[guild]} — drag parties into raid groups
-          </span>
-          <div className="ml-auto">
-            <GuildToggle active={guild} basePath="/raids" />
-          </div>
-        </div>
+        <TopNav guild={guild} active="raid" />
 
         {!persistenceEnabled && (
           <div className="border-b border-amber-400/40 bg-amber-950/80 px-4 py-1.5 text-center text-xs text-amber-200">
