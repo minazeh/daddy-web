@@ -96,6 +96,7 @@ export function PartyCard({
   onToggleLock,
   onRemoveMember,
   persistenceEnabled,
+  noHealer = false,
 }: {
   party: Party;
   membersById: Map<string, Member>;
@@ -103,6 +104,7 @@ export function PartyCard({
   onToggleLock: (partyId: string, index: number) => void;
   onRemoveMember: (partyId: string, memberId: string) => void;
   persistenceEnabled: boolean;
+  noHealer?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(party.name);
@@ -124,7 +126,20 @@ export function PartyCard({
   }
 
   return (
-    <div className="neon-edge w-full rounded-xl border border-indigo-400/30 bg-gradient-to-b from-[#161634] to-[#10101f] p-2.5">
+    <div
+      className={[
+        "neon-edge w-full rounded-xl border bg-gradient-to-b from-[#161634] to-[#10101f] p-2.5",
+        noHealer ? "border-amber-400/60" : "border-indigo-400/30",
+      ].join(" ")}
+    >
+      {noHealer && (
+        <div
+          className="mb-2 flex items-center gap-1 rounded bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-400/40"
+          title="No Priest could be assigned — healer pool exhausted"
+        >
+          ⚠ No Priest
+        </div>
+      )}
       {/* Header */}
       <div className="mb-2 flex items-center justify-between gap-2 rounded-lg bg-indigo-500/10 px-2 py-1.5">
         {editing ? (

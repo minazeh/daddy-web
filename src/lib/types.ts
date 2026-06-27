@@ -90,3 +90,48 @@ export function partyIdFor(
 ): string {
   return `${type}-${field}-${position}`;
 }
+
+// ---- Roles (for the roster auto-fill / Generate) ----
+// Maps a member's `className` (from the members collection) to a comp role.
+// EASY TO EDIT: add/move class names here. Anything not listed (or null/unknown
+// className) is treated as generic DPS/flex and NEVER counts as a Priest.
+export type Role = "tank" | "healer" | "dps";
+
+export const CLASS_ROLE: Record<string, Role> = {
+  Knight: "tank",
+  Priest: "healer",
+  Assassin: "dps",
+  Hunter: "dps",
+  Gunslinger: "dps",
+  Blacksmith: "dps",
+  Wizard: "dps",
+  Druid: "dps",
+};
+
+// The class that satisfies the "a Priest in every party" hard rule.
+export const HEALER_CLASS = "Priest";
+
+// Resolve a className to a role. Unknown/null -> generic DPS (flex), never healer.
+export function roleForClass(className: string | null): Role {
+  if (!className) return "dps";
+  return CLASS_ROLE[className] ?? "dps";
+}
+
+// Is this member a Priest (the healer that satisfies the hard rule)?
+export function isHealer(className: string | null): boolean {
+  return className === HEALER_CLASS;
+}
+
+// SINGLE SOURCE OF TRUTH for Priest-presence. A party "has a Priest" if ANY of
+// its CURRENT members — locked OR unlocked — is a Priest. Computed LIVE from the
+// party's actual `memberIds` (look up each member's className), never from a
+// flag stored at Generate time. Reused by the card badge, the toolbar shortage
+// count, and the Generate hard rule so all three agree.
+export function partyHasPriest(
+  party: Pick<Party, "memberIds">,
+  membersById: Map<string, Pick<Member, "className">>,
+): boolean {
+  return party.memberIds.some((id) =>
+    isHealer(membersById.get(id)?.className ?? null),
+  );
+}

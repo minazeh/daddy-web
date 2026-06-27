@@ -34,6 +34,33 @@ data, and none is invented.)
 **Every slot change auto-saves** — drag assignments, locks, and renames persist
 immediately. There is no manual save button.
 
+### Roster auto-fill toolbar
+
+A toolbar above the field grid has three buttons, all scoped to the
+**currently-viewed guild** (both its Main + Sub fields). Randomness lives in the
+server actions, so there is no hydration concern.
+
+- **Generate** — auto-assigns the unlocked slots. Locked slots are frozen
+  (preserved). It builds the available pool from this guild's members who are
+  not pinned in a locked slot, clears all unlocked slots, then fills:
+  1. **Hard rule — a Priest in every party:** each party lacking a (locked)
+     Priest gets one from the Priest pool first. If Priests run short, it fills
+     as many as it can and shows a **"⚠ No Priest"** badge on the parties left
+     without one.
+  2. **Balanced (best-effort):** ~1 Tank (Knight) then DPS to round out each
+     5-slot party, randomized so repeated Generates differ.
+  No member is placed in two parties; the 5-slot cap is respected; fills stop
+  when the pool is exhausted (later parties may be partial).
+- **Reset** — clears only the **unlocked** slots (members return to the pool);
+  locked members stay pinned; locks unchanged. (Confirm prompt.)
+- **Reset Lock** — clears **everything** for the guild: all assignments **and**
+  all locks → a blank board. (Confirm prompt; destructive.)
+
+The role mapping is the `CLASS_ROLE` constant in `src/lib/types.ts` (easy to
+edit): **Tank** = Knight; **Healer** = Priest; **DPS** = Assassin, Hunter,
+Gunslinger, Blacksmith, Wizard, Druid. A member with an unknown/null `className`
+is generic DPS/flex and never counts as a Priest.
+
 Guild membership maps to the bot's member flags:
 
 - **Daddy** guild = members where `isMain === true`, parties where `type === 'daddy'`
@@ -143,7 +170,7 @@ access, Node version, and the two deploy paths: GitHub Git integration or the
 | `src/lib/mongo.ts` | Server-only cached `MongoClient` singleton. |
 | `src/lib/types.ts` | Shared `Guild` / `Field` / `Member` / `Party` types + field sizes + `MAX_PARTY_SLOTS`. |
 | `src/lib/data.ts` | Per-guild reads + idempotent field seeding (`ensureGuildParties`, `getMembers`, `getParties`). |
-| `src/lib/actions.ts` | Server actions: `updateParty` (slots), `setPartyLocks`, `renameParty`. |
+| `src/lib/actions.ts` | Server actions: `updateParty`, `setPartyLocks`, `renameParty`, and roster auto-fill `generateGuild` / `resetGuild` / `resetLockGuild`. |
 | `src/lib/mock.ts` | Local-dev fallback data (no DB). |
 | `src/app/page.tsx` | Server component; reads `?guild=`, fetches that guild only, renders `BuilderShell`. |
 | `src/components/BuilderShell.tsx` | Client builder: two-pane layout, single `DndContext`, scrollable board with two field grids, auto-save handlers. |

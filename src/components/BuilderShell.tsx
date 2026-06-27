@@ -16,13 +16,22 @@ import {
   CARDS_PER_ROW,
   FIELDS,
   FIELD_LABEL,
+  GUILD_LABEL,
   MAX_PARTY_SLOTS,
+  partyHasPriest,
   type Field,
   type Guild,
   type Member,
   type Party,
 } from "@/lib/types";
-import { renameParty, setPartyLocks, updateParty } from "@/lib/actions";
+import {
+  generateGuild,
+  renameParty,
+  resetGuild,
+  resetLockGuild,
+  setPartyLocks,
+  updateParty,
+} from "@/lib/actions";
 import { MemberPool, POOL_ID } from "./MemberPool";
 import { PartyCard } from "./PartyCard";
 import { MemberChip, type DragData } from "./MemberChip";
@@ -59,6 +68,9 @@ export function BuilderShell({
   const [activeMember, setActiveMember] = useState<Member | null>(null);
   const [, startTransition] = useTransition();
 
+  // Disables the toolbar buttons while a bulk op is running.
+  const [busy, setBusy] = useState(false);
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
@@ -74,6 +86,21 @@ export function BuilderShell({
     for (const p of parties) for (const id of p.memberIds) s.add(id);
     return s;
   }, [parties]);
+
+  // LIVE "no Priest" set — computed from CURRENT party membership (locked OR
+  // unlocked) via the shared partyHasPriest helper, NOT from a flag stored at
+  // Generate time. So manually dragging/locking a Priest into a party clears its
+  // badge immediately. A party with NO members isn't flagged (nothing to heal
+  // yet) — only a party that has members but none of them are a Priest.
+  const noHealerIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const p of parties) {
+      if (p.memberIds.length > 0 && !partyHasPriest(p, membersById)) {
+        s.add(p.partyId);
+      }
+    }
+    return s;
+  }, [parties, membersById]);
 
   // Group parties by field for the two stacked sections, each sorted by index.
   const partiesByField = useMemo(() => {
@@ -208,6 +235,56 @@ export function BuilderShell({
     }
   }
 
+  // ---- roster auto-fill toolbar (all scoped to THIS guild, both fields) ----
+  async function handleGenerate() {
+    if (!persistenceEnabled || busy) return;
+    setBusy(true);
+    try {
+      const res = await generateGuild(guild);
+      if (res.ok && res.parties) {
+        setParties(res.parties);
+        // No need to read res.partiesWithoutHealer — the badge/shortage are
+        // now computed LIVE from party membership (see noHealerIds memo).
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleReset() {
+    if (!persistenceEnabled || busy) return;
+    if (
+      !window.confirm(
+        "Reset will clear all UNLOCKED slots for this guild (locked members stay). Continue?",
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const res = await resetGuild(guild);
+      if (res.ok && res.parties) setParties(res.parties);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResetLock() {
+    if (!persistenceEnabled || busy) return;
+    if (
+      !window.confirm(
+        "Reset Lock will clear EVERYTHING for this guild — all assignments AND all locks — leaving a blank board. This cannot be undone. Continue?",
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      const res = await resetLockGuild(guild);
+      if (res.ok && res.parties) setParties(res.parties);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <DndContext
       // Stable explicit id: without it dnd-kit auto-generates the
@@ -234,6 +311,50 @@ export function BuilderShell({
               <code>MONGODB_URI</code> in <code>.env.local</code> to persist.
             </div>
           )}
+
+          {/* Roster auto-fill toolbar (scoped to the current guild, both fields). */}
+          <div className="sticky top-0 z-20 flex flex-wrap items-center gap-2 border-b border-indigo-500/20 bg-[#0c0c1c]/90 px-6 py-2 backdrop-blur">
+            <span className="mr-1 text-xs font-semibold tracking-wide text-slate-400 uppercase">
+              {GUILD_LABEL[guild]} roster
+            </span>
+            <button
+              type="button"
+              onClick={handleGenerate}
+              disabled={!persistenceEnabled || busy}
+              title={
+                persistenceEnabled
+                  ? "Auto-fill unlocked slots (a Priest per party, balanced)"
+                  : "Needs MONGODB_URI"
+              }
+              className="rounded-md bg-gradient-to-r from-indigo-600 to-fuchsia-600 px-3 py-1.5 text-sm font-semibold text-white hover:from-indigo-500 hover:to-fuchsia-500 disabled:opacity-40"
+            >
+              {busy ? "Working…" : "Generate"}
+            </button>
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={!persistenceEnabled || busy}
+              title="Clear unlocked slots (locked members stay)"
+              className="rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-slate-100 hover:bg-indigo-900/70 disabled:opacity-40"
+            >
+              Reset
+            </button>
+            <button
+              type="button"
+              onClick={handleResetLock}
+              disabled={!persistenceEnabled || busy}
+              title="Clear everything incl. locks (blank board)"
+              className="rounded-md border border-red-400/40 bg-red-950/40 px-3 py-1.5 text-sm font-medium text-red-200 hover:bg-red-900/40 disabled:opacity-40"
+            >
+              Reset Lock
+            </button>
+            {noHealerIds.size > 0 && (
+              <span className="ml-1 rounded bg-amber-500/20 px-2 py-1 text-xs font-medium text-amber-300 ring-1 ring-amber-400/40">
+                ⚠ {noHealerIds.size}{" "}
+                {noHealerIds.size === 1 ? "party" : "parties"} without a Priest
+              </span>
+            )}
+          </div>
 
           {/* Two stacked field sections: Main Field (12) above, a divider,
               Sub Field (18) below — each a 5-per-row grid. */}
@@ -272,6 +393,7 @@ export function BuilderShell({
                       onToggleLock={handleToggleLock}
                       onRemoveMember={removeFromParty}
                       persistenceEnabled={persistenceEnabled}
+                      noHealer={noHealerIds.has(p.partyId)}
                     />
                   ))}
                 </div>

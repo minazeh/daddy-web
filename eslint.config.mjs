@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Throwaway one-off DB diagnostic scripts (not app code).
+    "scripts/_*.mjs",
   ]),
 ]);
 
