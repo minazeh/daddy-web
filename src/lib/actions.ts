@@ -1,15 +1,20 @@
 "use server";
 
+import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { getDb, isMongoConfigured } from "./mongo";
-import { getMembers, getParties } from "./data";
+import { getMembers, getParties, getPowerMap, getRaidGroups } from "./data";
+import { MOCK_MEMBER_META, MOCK_RAID_GROUPS } from "./mock";
 import {
   MAX_PARTY_SLOTS,
   isHealer,
+  normalizePower,
   roleForClass,
+  type Field,
   type Guild,
   type Member,
   type Party,
+  type RaidGroup,
 } from "./types";
 
 // Server actions that mutate the `parties` collection (db `discordbot`).
@@ -157,33 +162,42 @@ function buildPlans(parties: Party[], memberById: Map<string, Member>): PartyPla
   });
 }
 
-// Core generation over a set of parties + the available member pool.
+// Core generation over a set of parties + the available member pool, POWER-AWARE.
 // Mutates plans' slots. Returns the set of partyIds left WITHOUT a healer.
-function generatePlans(plans: PartyPlan[], pool: Member[]): Set<string> {
-  // Pools by role from the AVAILABLE members (not pinned in a locked slot).
-  const healers = shuffle(pool.filter((m) => isHealer(m.className)));
-  const tanks = shuffle(
+//
+// Heuristic (after the Priest hard rule + respecting locks):
+//   - Each party's running power = sum of power of its current members
+//     (LOCKED members' power counts toward their party from the start).
+//   - PASS 1 (Priests): assign each priestless party a Priest, giving the
+//     HIGHEST-power available Priest to the currently-LOWEST-power party first.
+//   - PASS 2 (Tank spread): give ~1 Tank per party that has none, again
+//     highest-power tank → lowest-power party.
+//   - PASS 3 (balance fill): repeatedly take the HIGHEST-power remaining member
+//     and place it into the currently-LOWEST-power party that still has a free
+//     slot. This greedy "largest-first into smallest-bin" minimizes the spread
+//     of party power sums (a standard multiway-partition heuristic).
+// Members of equal power are shuffled so repeated Generates differ.
+function generatePlans(
+  plans: PartyPlan[],
+  pool: Member[],
+  powerOf: (uid: string) => number,
+): Set<string> {
+  // Sort a member list by power DESC, ties broken randomly (shuffle then sort
+  // is stable enough given we re-shuffle equal-power runs implicitly).
+  const byPowerDesc = (list: Member[]) =>
+    shuffle(list.slice()).sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
+
+  const healers = byPowerDesc(pool.filter((m) => isHealer(m.className)));
+  const tanks = byPowerDesc(
     pool.filter((m) => roleForClass(m.className) === "tank"),
   );
-  const dps = shuffle(
+  const dps = byPowerDesc(
     pool.filter(
       (m) => !isHealer(m.className) && roleForClass(m.className) !== "tank",
     ),
   );
-  // "tank" role == Knight; healer == Priest; everything else == dps/flex.
 
   const used = new Set<string>();
-  function take(list: Member[]): string | null {
-    while (list.length) {
-      const m = list.pop()!;
-      if (!used.has(m.userId)) {
-        used.add(m.userId);
-        return m.userId;
-      }
-    }
-    return null;
-  }
-
   const freeSlots = (plan: PartyPlan): number[] => {
     const out: number[] = [];
     for (let i = 0; i < MAX_PARTY_SLOTS; i++) {
@@ -198,55 +212,87 @@ function generatePlans(plans: PartyPlan[], pool: Member[]): Set<string> {
     return true;
   };
 
+  // Running power sum per party (seed with locked/existing members' power).
+  const power = new Map<string, number>();
+  for (const plan of plans) {
+    let sum = 0;
+    for (const uid of plan.slots) if (uid) sum += powerOf(uid);
+    power.set(plan.partyId, sum);
+  }
+  const addPower = (plan: PartyPlan, uid: string) =>
+    power.set(plan.partyId, (power.get(plan.partyId) ?? 0) + powerOf(uid));
+
+  // The party with the lowest running power that still has a free slot (and,
+  // optionally, passes a predicate). Ties broken by partyId for determinism.
+  const lowestOpen = (pred?: (p: PartyPlan) => boolean): PartyPlan | null => {
+    let best: PartyPlan | null = null;
+    for (const plan of plans) {
+      if (freeSlots(plan).length === 0) continue;
+      if (pred && !pred(plan)) continue;
+      if (
+        best === null ||
+        (power.get(plan.partyId) ?? 0) < (power.get(best.partyId) ?? 0) ||
+        ((power.get(plan.partyId) ?? 0) === (power.get(best.partyId) ?? 0) &&
+          plan.partyId.localeCompare(best.partyId) < 0)
+      ) {
+        best = plan;
+      }
+    }
+    return best;
+  };
+  const takeNext = (list: Member[]): Member | null => {
+    while (list.length) {
+      const m = list.shift()!; // highest power first (sorted desc)
+      if (!used.has(m.userId)) {
+        used.add(m.userId);
+        return m;
+      }
+    }
+    return null;
+  };
+
   const noHealer = new Set<string>();
 
   // PASS 1 — HARD RULE: a Priest in every party that doesn't already have one.
-  // A party that already contains a Priest (locked) is skipped — not given a
-  // second one, not flagged.
-  for (const plan of plans) {
-    if (plan.hasPriest) continue;
-    if (freeSlots(plan).length === 0) {
-      noHealer.add(plan.partyId); // full of locks, no room for a healer
-      continue;
-    }
-    const h = take(healers);
-    if (h) place(plan, h);
-    else noHealer.add(plan.partyId); // healer pool exhausted
+  // Highest-power Priest → currently-lowest-power priestless party.
+  const needPriest = plans.filter((p) => !p.hasPriest);
+  for (let k = 0; k < needPriest.length; k++) {
+    const target = lowestOpen((p) => !p.hasPriest && freeSlots(p).length > 0);
+    if (!target) break;
+    const h = takeNext(healers);
+    if (!h) break;
+    place(target, h.userId);
+    addPower(target, h.userId);
+    target.hasPriest = true;
+  }
+  // Any priestless party we couldn't satisfy gets flagged.
+  for (const plan of plans) if (!plan.hasPriest) noHealer.add(plan.partyId);
+
+  // PASS 2 — TANK SPREAD: ~1 Tank per party lacking one, highest-power tank →
+  // lowest-power party. (We don't track tank-presence precisely; one pass that
+  // hands a tank to each lowest-power open party is enough for a rough spread.)
+  for (let k = 0; k < plans.length && tanks.some((t) => !used.has(t.userId)); k++) {
+    const target = lowestOpen();
+    if (!target) break;
+    const t = takeNext(tanks);
+    if (!t) break;
+    place(target, t.userId);
+    addPower(target, t.userId);
   }
 
-  // PASS 2 — BALANCED: aim for ~1 Tank then fill the rest with DPS (then any
-  // leftover healers as flex) per party, randomized, until pools run dry.
-  // One tank per party first.
-  for (const plan of plans) {
-    if (freeSlots(plan).length === 0) continue;
-    const t = take(tanks);
-    if (t) place(plan, t);
-  }
-  // Fill remaining free slots with DPS, then leftover tanks, then leftover
-  // healers — round-robin across parties so fills spread out rather than
-  // packing the first parties.
-  const fillers = shuffle([...dps, ...tanks, ...healers].filter((m) => !used.has(m.userId)));
-  let progressed = true;
-  while (fillers.length && progressed) {
-    progressed = false;
-    for (const plan of plans) {
-      if (freeSlots(plan).length === 0) continue;
-      // pull next unused filler
-      let uid: string | null = null;
-      while (fillers.length) {
-        const m = fillers.pop()!;
-        if (!used.has(m.userId)) {
-          used.add(m.userId);
-          uid = m.userId;
-          break;
-        }
-      }
-      if (uid) {
-        place(plan, uid);
-        progressed = true;
-      }
-      if (!fillers.length) break;
-    }
+  // PASS 3 — BALANCE FILL: highest-power remaining member → lowest-power open
+  // party, until everyone is placed or all slots are full. Merge leftover
+  // dps/tanks/healers and always pull the globally highest-power unused one.
+  const remaining = [...dps, ...tanks, ...healers]
+    .filter((m) => !used.has(m.userId))
+    .sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
+  for (const m of remaining) {
+    if (used.has(m.userId)) continue;
+    const target = lowestOpen();
+    if (!target) break; // no free slots anywhere
+    used.add(m.userId);
+    place(target, m.userId);
+    addPower(target, m.userId);
   }
 
   return noHealer;
@@ -266,11 +312,13 @@ export interface GenerateResult extends BulkResult {
 export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   if (!isMongoConfigured) return NOT_CONFIGURED;
 
-  const [members, parties] = await Promise.all([
-    getMembers(guild),
+  const [members, parties, powerMap] = await Promise.all([
+    getMembers(guild), // ACTIVE members only (present in `members`)
     getParties(guild),
+    getPowerMap(guild),
   ]);
   const memberById = new Map(members.map((m) => [m.userId, m]));
+  const powerOf = (uid: string) => powerMap.get(uid) ?? 0;
 
   const plans = buildPlans(parties, memberById);
 
@@ -284,7 +332,7 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   }
   const pool = members.filter((m) => !pinned.has(m.userId));
 
-  const noHealer = generatePlans(plans, pool);
+  const noHealer = generatePlans(plans, pool, powerOf);
 
   // Persist. Compact each plan's slots to a memberIds array. To preserve lock
   // index alignment, we write the slots array with trailing nulls trimmed but
@@ -375,4 +423,244 @@ export async function resetLockGuild(guild: Guild): Promise<BulkResult> {
   );
   revalidatePath("/");
   return { ok: true, parties: await getParties(guild) };
+}
+
+// ============================================================================
+// RAID GROUPS — the layer ABOVE parties (Members → Parties → Raid Groups).
+// Scoped per guild AND per field; a party belongs to AT MOST ONE raid group
+// within its (type, field). Manual create/delete. All ops auto-save and return
+// the fresh raid-group list for the guild (optimistic UI). Mock mode mutates an
+// in-memory store.
+// ============================================================================
+
+const RAID_GROUPS = "raidGroups";
+
+export interface RaidResult extends ActionResult {
+  raidGroups?: RaidGroup[];
+}
+
+function revalidateRaids() {
+  revalidatePath("/raids");
+  revalidatePath("/");
+}
+
+// mock-mode helper: return this guild's raid groups, deterministically ordered.
+function mockReturn(guild: Guild): RaidResult {
+  const list = MOCK_RAID_GROUPS.filter((r) => r.type === guild)
+    .map((r) => ({ ...r, partyIds: [...r.partyIds] }))
+    .sort((a, b) =>
+      a.position !== b.position
+        ? a.position - b.position
+        : a.raidGroupId.localeCompare(b.raidGroupId),
+    );
+  return { ok: true, raidGroups: list };
+}
+
+export async function createRaidGroup(
+  guild: Guild,
+  field: Field,
+): Promise<RaidResult> {
+  if (!isMongoConfigured) {
+    const count = MOCK_RAID_GROUPS.filter(
+      (r) => r.type === guild && r.field === field,
+    ).length;
+    MOCK_RAID_GROUPS.push({
+      raidGroupId: randomUUID(),
+      type: guild,
+      field,
+      name: `${field === "main" ? "Main" : "Sub"} Raid ${count + 1}`,
+      partyIds: [],
+      position: count,
+      updatedAt: new Date().toISOString(),
+    });
+    return mockReturn(guild);
+  }
+
+  const db = await getDb();
+  const col = db.collection<RaidGroup>(RAID_GROUPS);
+  const count = await col.countDocuments({ type: guild, field });
+  await col.insertOne({
+    raidGroupId: randomUUID(),
+    type: guild,
+    field,
+    name: `${field === "main" ? "Main" : "Sub"} Raid ${count + 1}`,
+    partyIds: [],
+    position: count,
+    updatedAt: new Date().toISOString(),
+  });
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+export async function renameRaidGroup(
+  guild: Guild,
+  raidGroupId: string,
+  name: string,
+): Promise<RaidResult> {
+  const trimmed = name.trim().slice(0, 80);
+  if (!trimmed) return { ok: false, message: "Name cannot be empty." };
+
+  if (!isMongoConfigured) {
+    const r = MOCK_RAID_GROUPS.find((g) => g.raidGroupId === raidGroupId);
+    if (r) r.name = trimmed;
+    return mockReturn(guild);
+  }
+  const db = await getDb();
+  await db.collection<RaidGroup>(RAID_GROUPS).updateOne(
+    { raidGroupId },
+    { $set: { name: trimmed, updatedAt: new Date().toISOString() } },
+  );
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+// DELETE: remove ONLY the raid group. Its parties are NOT deleted — they simply
+// stop being in any raid group, so they return to the field's unassigned pool.
+// (Parties + their members are untouched.)
+export async function deleteRaidGroup(
+  guild: Guild,
+  raidGroupId: string,
+): Promise<RaidResult> {
+  if (!isMongoConfigured) {
+    const i = MOCK_RAID_GROUPS.findIndex((g) => g.raidGroupId === raidGroupId);
+    if (i >= 0) MOCK_RAID_GROUPS.splice(i, 1);
+    return mockReturn(guild);
+  }
+  const db = await getDb();
+  await db.collection<RaidGroup>(RAID_GROUPS).deleteOne({ raidGroupId });
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+// ASSIGN / MOVE a party into a raid group. Enforces the one-raid-per-party
+// invariant SERVER-SIDE: the party is first pulled from EVERY other raid group
+// in the same (type, field), then appended to the target. moveParty is the same
+// operation (assigning to a different group implicitly moves it).
+async function assignPartyImpl(
+  guild: Guild,
+  partyId: string,
+  toRaidGroupId: string,
+): Promise<RaidResult> {
+  if (!isMongoConfigured) {
+    const target = MOCK_RAID_GROUPS.find(
+      (g) => g.raidGroupId === toRaidGroupId && g.type === guild,
+    );
+    if (!target) return { ok: false, message: "Raid group not found." };
+    for (const g of MOCK_RAID_GROUPS) {
+      if (g.type === guild && g.field === target.field) {
+        g.partyIds = g.partyIds.filter((id) => id !== partyId);
+      }
+    }
+    if (!target.partyIds.includes(partyId)) target.partyIds.push(partyId);
+    return mockReturn(guild);
+  }
+
+  const db = await getDb();
+  const col = db.collection<RaidGroup>(RAID_GROUPS);
+  const target = await col.findOne({ raidGroupId: toRaidGroupId, type: guild });
+  if (!target) return { ok: false, message: "Raid group not found." };
+
+  // Pull the party from every raid group of the same (type, field)...
+  await col.updateMany(
+    { type: guild, field: target.field },
+    {
+      $pull: { partyIds: partyId },
+      $set: { updatedAt: new Date().toISOString() },
+    },
+  );
+  // ...then add it to the target (addToSet = no dupes).
+  await col.updateOne(
+    { raidGroupId: toRaidGroupId },
+    {
+      $addToSet: { partyIds: partyId },
+      $set: { updatedAt: new Date().toISOString() },
+    },
+  );
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+export async function assignPartyToRaid(
+  guild: Guild,
+  partyId: string,
+  raidGroupId: string,
+): Promise<RaidResult> {
+  return assignPartyImpl(guild, partyId, raidGroupId);
+}
+
+export async function moveParty(
+  guild: Guild,
+  partyId: string,
+  toRaidGroupId: string,
+): Promise<RaidResult> {
+  return assignPartyImpl(guild, partyId, toRaidGroupId);
+}
+
+// REMOVE a party from its raid group → back to the field's unassigned pool.
+// (Pulled from ALL of the guild's raid groups defensively.)
+export async function removePartyFromRaid(
+  guild: Guild,
+  partyId: string,
+): Promise<RaidResult> {
+  if (!isMongoConfigured) {
+    for (const g of MOCK_RAID_GROUPS) {
+      if (g.type === guild) {
+        g.partyIds = g.partyIds.filter((id) => id !== partyId);
+      }
+    }
+    return mockReturn(guild);
+  }
+  const db = await getDb();
+  await db.collection<RaidGroup>(RAID_GROUPS).updateMany(
+    { type: guild },
+    {
+      $pull: { partyIds: partyId },
+      $set: { updatedAt: new Date().toISOString() },
+    },
+  );
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+// ============================================================================
+// MEMBER POWER — manual rating stored in the web-owned `memberMeta` collection
+// (never in `members`, so the bot's sync can't wipe it). Validates a
+// non-negative integer; persists; revalidates the pages that use power.
+// ============================================================================
+
+const MEMBER_META = "memberMeta";
+
+export interface PowerResult extends ActionResult {
+  userId?: string;
+  power?: number;
+}
+
+export async function setMemberPower(
+  userId: string,
+  power: number,
+): Promise<PowerResult> {
+  const value = normalizePower(power);
+
+  if (!isMongoConfigured) {
+    const existing = MOCK_MEMBER_META.get(userId);
+    if (existing) {
+      existing.power = value;
+      existing.updatedAt = new Date().toISOString();
+    }
+    // Power feeds Generate (/) and is shown on /members.
+    revalidatePath("/members");
+    revalidatePath("/");
+    return { ok: true, userId, power: value };
+  }
+
+  const db = await getDb();
+  // Only update an EXISTING meta row's power (rows are created by the on-load
+  // sync). $set power + updatedAt; never touches cached roster fields here.
+  await db.collection(MEMBER_META).updateOne(
+    { userId },
+    { $set: { power: value, updatedAt: new Date() } },
+  );
+  revalidatePath("/members");
+  revalidatePath("/");
+  return { ok: true, userId, power: value };
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useMemo, useState, useTransition } from "react";
 import {
   DndContext,
@@ -354,6 +355,18 @@ export function BuilderShell({
                 {noHealerIds.size === 1 ? "party" : "parties"} without a Priest
               </span>
             )}
+            <Link
+              href={`/members?guild=${guild}`}
+              className="ml-auto rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-indigo-100 hover:bg-indigo-900/70"
+            >
+              Members
+            </Link>
+            <Link
+              href={`/raids?guild=${guild}`}
+              className="rounded-md border border-indigo-400/40 bg-indigo-950/70 px-3 py-1.5 text-sm font-medium text-indigo-100 hover:bg-indigo-900/70"
+            >
+              Manage Raid Groups →
+            </Link>
           </div>
 
           {/* Two stacked field sections: Main Field (12) above, a divider,

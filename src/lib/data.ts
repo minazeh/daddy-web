@@ -1,6 +1,13 @@
 import "server-only";
+import { revalidatePath } from "next/cache";
+import type { AnyBulkWriteOperation, Collection } from "mongodb";
 import { getDb, isMongoConfigured } from "./mongo";
-import { MOCK_MEMBERS, MOCK_PARTIES } from "./mock";
+import {
+  MOCK_MEMBERS,
+  MOCK_MEMBER_META,
+  MOCK_PARTIES,
+  MOCK_RAID_GROUPS,
+} from "./mock";
 import {
   FIELDS,
   FIELD_LABEL,
@@ -8,8 +15,11 @@ import {
   partyIdFor,
   type Field,
   type Guild,
+  type ManagedMember,
   type Member,
+  type MemberMeta,
   type Party,
+  type RaidGroup,
 } from "./types";
 
 // Server-side data access layer.
@@ -117,6 +127,153 @@ export async function getMembers(guild: Guild): Promise<Member[]> {
   return docs.map(serializeMember).sort(compareMembers);
 }
 
+// ---- memberMeta: web-owned power ratings + historical roster ----
+
+const MEMBER_META = "memberMeta";
+
+interface MemberMetaDoc {
+  userId: string;
+  power?: number;
+  displayName?: string;
+  username?: string;
+  className?: string | null;
+  classRoleId?: string | null;
+  isMain?: boolean;
+  isSub?: boolean;
+  avatarUrl?: string | null;
+  lastSeenAt?: Date | string;
+  updatedAt?: Date | string;
+}
+
+function serializeMeta(d: MemberMetaDoc): MemberMeta {
+  return {
+    userId: d.userId,
+    power: typeof d.power === "number" && d.power >= 0 ? Math.floor(d.power) : 0,
+    displayName: d.displayName ?? d.username ?? d.userId,
+    username: d.username ?? "",
+    className: d.className ?? null,
+    classRoleId: d.classRoleId ?? null,
+    isMain: Boolean(d.isMain),
+    isSub: Boolean(d.isSub),
+    avatarUrl: d.avatarUrl ?? null,
+    lastSeenAt: toIso(d.lastSeenAt),
+    updatedAt: toIso(d.updatedAt),
+  };
+}
+
+// Read ALL members currently in the live `members` collection (both guilds).
+async function getAllMembers(): Promise<Member[]> {
+  if (!isMongoConfigured) return MOCK_MEMBERS;
+  const db = await getDb();
+  const docs = await db.collection<MemberDoc>(MEMBERS).find({}).toArray();
+  return docs.map(serializeMember);
+}
+
+// Upsert memberMeta for every CURRENT member: refresh cached fields + lastSeenAt
+// and set power=0 for NEW members, but NEVER overwrite an existing member's
+// power (that's the manual rating). Idempotent + race-safe ($set cached fields,
+// $setOnInsert power). Returns a userId -> meta map for ALL meta rows.
+export async function syncMemberMeta(): Promise<Map<string, MemberMeta>> {
+  const current = await getAllMembers();
+  const nowIso = new Date().toISOString();
+
+  if (!isMongoConfigured) {
+    for (const m of current) {
+      const existing = MOCK_MEMBER_META.get(m.userId);
+      MOCK_MEMBER_META.set(m.userId, {
+        userId: m.userId,
+        power: existing?.power ?? 0, // never overwrite existing power
+        displayName: m.displayName,
+        username: m.username,
+        className: m.className,
+        classRoleId: m.classRoleId,
+        isMain: m.isMain,
+        isSub: m.isSub,
+        avatarUrl: m.avatarUrl,
+        lastSeenAt: nowIso,
+        updatedAt: nowIso,
+      });
+    }
+    return new Map(MOCK_MEMBER_META);
+  }
+
+  const db = await getDb();
+  const col = db.collection<MemberMetaDoc>(MEMBER_META);
+  await col.createIndex({ userId: 1 }, { unique: true });
+
+  if (current.length > 0) {
+    await col.bulkWrite(
+      current.map((m) => ({
+        updateOne: {
+          filter: { userId: m.userId },
+          update: {
+            // Refresh cached roster fields + lastSeenAt every load...
+            $set: {
+              displayName: m.displayName,
+              username: m.username,
+              className: m.className,
+              classRoleId: m.classRoleId,
+              isMain: m.isMain,
+              isSub: m.isSub,
+              avatarUrl: m.avatarUrl,
+              lastSeenAt: new Date(),
+              updatedAt: new Date(),
+            },
+            // ...but power is set ONLY on first insert (never reset on re-sync).
+            $setOnInsert: { power: 0 },
+          },
+          upsert: true,
+        },
+      })),
+      { ordered: false },
+    );
+  }
+
+  const docs = await col.find({}).toArray();
+  const map = new Map<string, MemberMeta>();
+  for (const d of docs) map.set(d.userId, serializeMeta(d));
+  return map;
+}
+
+// Members for the /members management page, for ONE guild: ACTIVE members
+// (present in `members`) joined with power + DEPARTED members (memberMeta rows
+// no longer in `members`, matched to the guild via cached isMain/isSub). Each
+// tagged `active`. Deterministically ordered (active first, then by power desc,
+// then displayName, then userId).
+export async function getMembersForManagement(
+  guild: Guild,
+): Promise<ManagedMember[]> {
+  const meta = await syncMemberMeta();
+  const current = await getAllMembers();
+  const activeIds = new Set(current.map((m) => m.userId));
+  const inGuild = (m: { isMain: boolean; isSub: boolean }) =>
+    guild === "daddy" ? m.isMain : m.isSub;
+
+  const out: ManagedMember[] = [];
+  for (const m of meta.values()) {
+    if (!inGuild(m)) continue;
+    out.push({ ...m, active: activeIds.has(m.userId) });
+  }
+  out.sort((a, b) => {
+    if (a.active !== b.active) return a.active ? -1 : 1;
+    if (a.power !== b.power) return b.power - a.power;
+    const byName = a.displayName.localeCompare(b.displayName);
+    return byName !== 0 ? byName : a.userId.localeCompare(b.userId);
+  });
+  return out;
+}
+
+// Power lookup for the current guild's ACTIVE members (used by Generate). Keyed
+// userId -> power, default 0.
+export async function getPowerMap(guild: Guild): Promise<Map<string, number>> {
+  const meta = await syncMemberMeta();
+  const map = new Map<string, number>();
+  for (const m of meta.values()) {
+    if (guild === "daddy" ? m.isMain : m.isSub) map.set(m.userId, m.power);
+  }
+  return map;
+}
+
 // Total-order comparator for parties: by field (main before sub), then
 // position, then unique partyId tiebreaker.
 function comparePartiesByOrder(a: Party, b: Party): number {
@@ -160,10 +317,16 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
         out.push(blankParty(guild, field, i));
       }
     }
-    // Fold any mock member assignments onto matching canonical ids.
+    // Fold any mock member assignments onto matching canonical ids, pruning any
+    // id not in the mock roster (mirrors the live reconcile).
+    const valid = new Set(
+      MOCK_MEMBERS.filter((m) => (guild === "daddy" ? m.isMain : m.isSub)).map(
+        (m) => m.userId,
+      ),
+    );
     for (const m of MOCK_PARTIES) {
       const hit = out.find((p) => p.partyId === m.partyId);
-      if (hit) hit.memberIds = m.memberIds;
+      if (hit) hit.memberIds = m.memberIds.filter((id) => valid.has(id));
     }
     return out.sort(comparePartiesByOrder);
   }
@@ -224,14 +387,83 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
   }
   await col.bulkWrite(ops, { ordered: false });
 
-  // Return the canonical set, correcting field/position from the id for any
+  // Read back the canonical set, correcting field/position from the id for any
   // legacy canonical-id doc that predated the `field` column.
   const docs = await col.find({ type: guild }).toArray();
-  return docs
+  const parties = docs
     .filter((d) => canonical.has(d.partyId))
     .map(serializeParty)
     .map((p) => normalizeFieldFromId(p))
     .sort(comparePartiesByOrder);
+
+  // Reconcile against the live roster: prune userIds that are no longer in this
+  // guild's `members` (departed / de-roled — the bot's removeStale dropped them
+  // from the pool, but their id can linger in a party). Idempotent: writes back
+  // only parties that actually changed.
+  const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
+  return reconcileParties(col, parties, validIds);
+}
+
+// Remove any memberId not in `validIds` from each party's memberIds, and if a
+// pruned member sat in a LOCKED slot, drop that index from lockedSlots too (the
+// pinned member is gone → free + unlock the slot). Persists ONLY changed
+// parties (no-op writes otherwise). Returns the pruned, in-memory party list so
+// the caller doesn't need a re-read. Race-safe: each write is an idempotent
+// $set keyed on the unique partyId; concurrent identical prunes converge.
+async function reconcileParties(
+  col: Collection<PartyDoc>,
+  parties: Party[],
+  validIds: Set<string>,
+): Promise<Party[]> {
+  const writes: AnyBulkWriteOperation<PartyDoc>[] = [];
+
+  const reconciled = parties.map((p) => {
+    let changed = false;
+    // Track which surviving members were in a locked slot so we can rebuild
+    // lockedSlots against the COMPACTED memberIds (a removed member shifts
+    // indexes). Locks reference slot indexes into memberIds.
+    const lockedSet = new Set(p.lockedSlots);
+    const keptLockedUids = new Set<string>();
+    const nextMemberIds: string[] = [];
+    for (let i = 0; i < p.memberIds.length; i++) {
+      const uid = p.memberIds[i];
+      if (validIds.has(uid)) {
+        if (lockedSet.has(i)) keptLockedUids.add(uid);
+        nextMemberIds.push(uid);
+      } else {
+        changed = true; // an orphan was pruned (member gone OR its lock dropped)
+      }
+    }
+    if (!changed) return p;
+
+    const nextLocked: number[] = [];
+    nextMemberIds.forEach((uid, idx) => {
+      if (keptLockedUids.has(uid)) nextLocked.push(idx);
+    });
+
+    writes.push({
+      updateOne: {
+        filter: { partyId: p.partyId },
+        update: {
+          $set: {
+            memberIds: nextMemberIds,
+            lockedSlots: nextLocked,
+            updatedAt: new Date(),
+          },
+        },
+      },
+    });
+    return { ...p, memberIds: nextMemberIds, lockedSlots: nextLocked };
+  });
+
+  // Only write when something actually changed (idempotent: zero orphans → zero
+  // writes). Revalidate so freed slots are immediately reusable.
+  if (writes.length > 0) {
+    await col.bulkWrite(writes, { ordered: false });
+    revalidatePath("/");
+  }
+
+  return reconciled;
 }
 
 // Derive field/position from a canonical id `${type}-${field}-${position}` so a
@@ -256,4 +488,54 @@ function normalizeFieldFromId(p: Party): Party {
 // Read the canonical fixed-structure parties for ONE guild (seeds if needed).
 export async function getParties(guild: Guild): Promise<Party[]> {
   return ensureGuildParties(guild);
+}
+
+// ---- Raid groups (the layer above parties) ----
+
+const RAID_GROUPS = "raidGroups";
+
+interface RaidGroupDoc {
+  raidGroupId: string;
+  type: Guild;
+  field?: Field;
+  name: string;
+  partyIds?: string[];
+  position?: number;
+  updatedAt?: Date | string;
+}
+
+function serializeRaidGroup(d: RaidGroupDoc): RaidGroup {
+  return {
+    raidGroupId: d.raidGroupId,
+    type: d.type,
+    field: d.field === "sub" ? "sub" : "main",
+    name: d.name,
+    partyIds: Array.isArray(d.partyIds) ? d.partyIds : [],
+    position: typeof d.position === "number" ? d.position : 0,
+    updatedAt: toIso(d.updatedAt),
+  };
+}
+
+// Deterministic total order for raid groups: by position, then unique id.
+export function compareRaidGroups(a: RaidGroup, b: RaidGroup): number {
+  return a.position !== b.position
+    ? a.position - b.position
+    : a.raidGroupId.localeCompare(b.raidGroupId);
+}
+
+// Read all raid groups for ONE guild (both fields), deterministically ordered.
+// The client splits them by field. Read-only here; writes live in actions.ts.
+export async function getRaidGroups(guild: Guild): Promise<RaidGroup[]> {
+  if (!isMongoConfigured) {
+    return MOCK_RAID_GROUPS.filter((r) => r.type === guild)
+      .map((r) => ({ ...r, partyIds: [...r.partyIds] }))
+      .sort(compareRaidGroups);
+  }
+  const db = await getDb();
+  const docs = await db
+    .collection<RaidGroupDoc>(RAID_GROUPS)
+    .find({ type: guild })
+    .sort({ position: 1, raidGroupId: 1 })
+    .toArray();
+  return docs.map(serializeRaidGroup).sort(compareRaidGroups);
 }

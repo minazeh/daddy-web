@@ -110,6 +110,10 @@ export function PartyCard({
   const [draft, setDraft] = useState(party.name);
 
   const lockedSet = new Set(party.lockedSlots);
+  // Defensive lookup: if a memberId has no record in the current roster (a
+  // departed member not yet pruned by the server-side reconcile), render the
+  // slot as empty rather than a broken chip. The prune (data.ts) is the primary
+  // mechanism that removes such ids; this guard just avoids any crash window.
   const slots: (Member | null)[] = Array.from(
     { length: MAX_PARTY_SLOTS },
     (_, i) => {

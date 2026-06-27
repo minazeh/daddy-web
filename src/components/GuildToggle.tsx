@@ -7,7 +7,13 @@ import { GUILDS, GUILD_LABEL, type Guild } from "@/lib/types";
 // reload (or shared URL) land on the same guild. Server component — no client
 // JS needed for the toggle itself.
 
-export function GuildToggle({ active }: { active: Guild }) {
+export function GuildToggle({
+  active,
+  basePath = "/",
+}: {
+  active: Guild;
+  basePath?: string; // "/" for the builder, "/raids" for the raids page
+}) {
   return (
     <div
       role="tablist"
@@ -19,7 +25,7 @@ export function GuildToggle({ active }: { active: Guild }) {
         return (
           <Link
             key={g}
-            href={`/?guild=${g}`}
+            href={`${basePath}?guild=${g}`}
             role="tab"
             aria-selected={selected}
             scroll={false}

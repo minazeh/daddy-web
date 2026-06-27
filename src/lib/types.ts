@@ -40,6 +40,39 @@ export interface Member {
   updatedAt: string; // ISO string (serialized from Mongo Date)
 }
 
+// Web-owned `memberMeta` collection — the source of truth for manual POWER
+// ratings + the HISTORICAL roster. Power and "departed" history must NOT live in
+// `members` (the bot's sync would wipe them). On load we upsert meta for every
+// current member: refresh the cached fields + lastSeenAt, set power=0 for NEW
+// members, and NEVER overwrite an existing member's power.
+export interface MemberMeta {
+  userId: string;
+  power: number; // manual rating, non-negative int, default 0
+  displayName: string;
+  username: string;
+  className: string | null;
+  classRoleId: string | null;
+  isMain: boolean;
+  isSub: boolean;
+  avatarUrl: string | null;
+  lastSeenAt: string; // ISO — last time seen in the live `members` collection
+  updatedAt: string; // ISO
+}
+
+// A member as shown on the /members management page: the cached roster fields +
+// power + whether they're currently active (present in `members`) or departed
+// (a memberMeta row whose userId is no longer in `members`).
+export interface ManagedMember extends MemberMeta {
+  active: boolean;
+}
+
+// Clamp arbitrary input to a valid power value (non-negative integer).
+export function normalizePower(v: unknown): number {
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(n, 1_000_000); // sane upper bound
+}
+
 // Each guild has a FIXED, pre-created field structure (no manual add):
 //   Main Field: 12 parties, Sub Field: 18 parties.
 // A party is identified by (type, field, position). Parties are seeded
@@ -89,6 +122,22 @@ export function partyIdFor(
   position: number,
 ): string {
   return `${type}-${field}-${position}`;
+}
+
+// ---- Raid Groups (the layer ABOVE parties) ----
+// A raid group holds PARTIES (Members → Parties → Raid Groups). Scoped per guild
+// AND per field: a Main raid group holds only Main parties, a Sub raid group
+// only Sub parties — never cross fields. A party belongs to AT MOST ONE raid
+// group within its (type, field). Raid groups are MANUAL (created on demand,
+// not pre-seeded). Web-owned collection `raidGroups`.
+export interface RaidGroup {
+  raidGroupId: string; // uuid
+  type: Guild;
+  field: Field;
+  name: string;
+  partyIds: string[]; // assigned party ids (no cap)
+  position: number; // ordering within (type, field)
+  updatedAt: string; // ISO string
 }
 
 // ---- Roles (for the roster auto-fill / Generate) ----

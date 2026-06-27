@@ -1,4 +1,4 @@
-import type { Member, Party } from "./types";
+import type { Member, MemberMeta, Party, RaidGroup } from "./types";
 
 // Local-dev fallback data, used ONLY when MONGODB_URI is unset so the
 // dashboard renders something to drag around without a live database.
@@ -26,3 +26,37 @@ export const MOCK_PARTIES: Party[] = [
   { partyId: "daddy-sub-0", type: "daddy", field: "sub", name: "Sub 1", memberIds: ["m3"], position: 0, x: 0, y: 0, lockedSlots: [], updatedAt: now },
   { partyId: "mummy-main-0", type: "mummy", field: "main", name: "Main 1", memberIds: ["s1"], position: 0, x: 0, y: 0, lockedSlots: [], updatedAt: now },
 ];
+
+// Mutable in-memory raid-group store for mock mode (no DB). Persists for the
+// life of the server process so create/assign/move/delete are visible during
+// local dev without MONGODB_URI. Cached on globalThis so HMR doesn't reset it.
+declare global {
+  var _mockRaidGroups: RaidGroup[] | undefined;
+  var _mockMemberMeta: Map<string, MemberMeta> | undefined;
+}
+export const MOCK_RAID_GROUPS: RaidGroup[] =
+  globalThis._mockRaidGroups ?? (globalThis._mockRaidGroups = []);
+
+// Mutable in-memory memberMeta store for mock mode (power + departed history).
+// Keyed by userId, globalThis-cached so HMR + power edits persist for the
+// process lifetime without a DB. Seeded once from MOCK_MEMBERS with power 0.
+export const MOCK_MEMBER_META: Map<string, MemberMeta> =
+  globalThis._mockMemberMeta ??
+  (globalThis._mockMemberMeta = new Map(
+    MOCK_MEMBERS.map((m) => [
+      m.userId,
+      {
+        userId: m.userId,
+        power: 0,
+        displayName: m.displayName,
+        username: m.username,
+        className: m.className,
+        classRoleId: m.classRoleId,
+        isMain: m.isMain,
+        isSub: m.isSub,
+        avatarUrl: m.avatarUrl,
+        lastSeenAt: now,
+        updatedAt: now,
+      },
+    ]),
+  ));
