@@ -1,65 +1,42 @@
-import Image from "next/image";
+import { getMembers, getParties } from "@/lib/data";
+import { isMongoConfigured } from "@/lib/mongo";
+import { BuilderShell } from "@/components/BuilderShell";
+import { DEFAULT_GUILD, isGuild, type Guild } from "@/lib/types";
 
-export default function Home() {
+// Dashboard server component. Daddy and Mummy are SEPARATE guilds; the page
+// renders exactly ONE of them, selected by the `?guild=` search param. On
+// toggle the URL changes, this server component re-runs, and it re-fetches only
+// the selected guild's members + parties — so each guild's slate is read fresh
+// from the DB and the two are never shown together.
+//
+// Layout is full-width (no centered max-width container): a left member panel +
+// a right zoom/pan canvas, both filling the viewport. The interactive shell is
+// a client component (drag-and-drop + zoom/pan); this server boundary only
+// fetches data and passes it down.
+
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ guild?: string }>;
+}) {
+  const { guild: guildParam } = await searchParams;
+  const guild: Guild = isGuild(guildParam) ? guildParam : DEFAULT_GUILD;
+
+  // Scoped to the selected guild only — never both.
+  const [members, parties] = await Promise.all([
+    getMembers(guild),
+    getParties(guild),
+  ]);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    // `key={guild}` forces a fresh shell per guild so no client state ever
+    // leaks across the Daddy/Mummy boundary.
+    <BuilderShell
+      key={guild}
+      guild={guild}
+      members={members}
+      parties={parties}
+      persistenceEnabled={isMongoConfigured}
+    />
   );
 }

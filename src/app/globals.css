@@ -1,26 +1,34 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+body {
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* Dotted grid backdrop for the zoom/pan canvas. */
+.canvas-grid {
+  background-color: #0b0b1a;
+  background-image: radial-gradient(
+    rgba(99, 102, 241, 0.18) 1px,
+    transparent 1px
+  );
+  background-size: 28px 28px;
+}
+
+/* Neon glow used by party cards / slot highlights. */
+.neon-edge {
+  box-shadow:
+    0 0 0 1px rgba(129, 140, 248, 0.4),
+    0 0 18px -2px rgba(99, 102, 241, 0.55),
+    inset 0 0 22px -10px rgba(168, 85, 247, 0.45);
+}
+
+.neon-edge-strong {
+  box-shadow:
+    0 0 0 1px rgba(168, 85, 247, 0.8),
+    0 0 26px -2px rgba(168, 85, 247, 0.8);
 }
