@@ -17,12 +17,12 @@ import {
   FIELDS,
   FIELD_LABEL,
   GUILD_LABEL,
-  MAX_PARTY_SLOTS,
-  partyHasPriest,
+  missingRequiredClasses,
   type Field,
   type Guild,
   type Member,
   type Party,
+  type Settings,
 } from "@/lib/types";
 import {
   generateGuild,
@@ -58,11 +58,13 @@ export function BuilderShell({
   guild,
   members,
   parties: initialParties,
+  settings,
   persistenceEnabled,
 }: {
   guild: Guild;
   members: Member[];
   parties: Party[];
+  settings: Settings;
   persistenceEnabled: boolean;
 }) {
   const [parties, setParties] = useState<Party[]>(initialParties);
@@ -88,20 +90,24 @@ export function BuilderShell({
     return s;
   }, [parties]);
 
-  // LIVE "no Priest" set — computed from CURRENT party membership (locked OR
-  // unlocked) via the shared partyHasPriest helper, NOT from a flag stored at
-  // Generate time. So manually dragging/locking a Priest into a party clears its
-  // badge immediately. A party with NO members isn't flagged (nothing to heal
-  // yet) — only a party that has members but none of them are a Priest.
-  const noHealerIds = useMemo(() => {
-    const s = new Set<string>();
+  // LIVE per-party "missing required classes" — computed from CURRENT party
+  // membership (locked OR unlocked) via missingRequiredClasses against
+  // settings.requiredClasses, NOT a flag stored at Generate time. So manually
+  // dragging/locking a required-class member in clears the badge immediately. A
+  // party with NO members isn't flagged (nothing to compose yet).
+  const missingByParty = useMemo(() => {
+    const m = new Map<string, string[]>();
     for (const p of parties) {
-      if (p.memberIds.length > 0 && !partyHasPriest(p, membersById)) {
-        s.add(p.partyId);
-      }
+      if (p.memberIds.length === 0) continue;
+      const miss = missingRequiredClasses(
+        p,
+        membersById,
+        settings.requiredClasses,
+      );
+      if (miss.length > 0) m.set(p.partyId, miss);
     }
-    return s;
-  }, [parties, membersById]);
+    return m;
+  }, [parties, membersById, settings.requiredClasses]);
 
   // Group parties by field for the two stacked sections, each sorted by index.
   const partiesByField = useMemo(() => {
@@ -254,7 +260,7 @@ export function BuilderShell({
     // ---- MOVE into an EMPTY slot (or member dropped onto its own slot) ----
     if (from === toPartyId) return; // already in this party (own/empty slot)
     if (target.memberIds.includes(memberId)) return; // dedupe
-    if (target.memberIds.length >= MAX_PARTY_SLOTS) return; // full, no swap
+    if (target.memberIds.length >= settings.partySize) return; // full, no swap
 
     const toIds = [...target.memberIds, memberId];
     let fromIds: string[] | null = null;
@@ -416,10 +422,11 @@ export function BuilderShell({
             >
               Reset Lock
             </button>
-            {noHealerIds.size > 0 && (
+            {missingByParty.size > 0 && (
               <span className="ml-1 rounded bg-amber-500/20 px-2 py-1 text-xs font-medium text-amber-300 ring-1 ring-amber-400/40">
-                ⚠ {noHealerIds.size}{" "}
-                {noHealerIds.size === 1 ? "party" : "parties"} without a Priest
+                ⚠ {missingByParty.size}{" "}
+                {missingByParty.size === 1 ? "party" : "parties"} missing
+                required classes
               </span>
             )}
           </div>
@@ -457,11 +464,12 @@ export function BuilderShell({
                       key={p.partyId}
                       party={p}
                       membersById={membersById}
+                      partySize={settings.partySize}
                       onRename={handleRename}
                       onToggleLock={handleToggleLock}
                       onRemoveMember={removeFromParty}
                       persistenceEnabled={persistenceEnabled}
-                      noHealer={noHealerIds.has(p.partyId)}
+                      missing={missingByParty.get(p.partyId) ?? []}
                     />
                   ))}
                 </div>

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
-import { MAX_PARTY_SLOTS, type Member, type Party } from "@/lib/types";
+import { type Member, type Party } from "@/lib/types";
 import { MemberChip } from "./MemberChip";
 
 // A party card in the fixed field grid (no free repositioning).
@@ -93,19 +93,22 @@ function Slot({
 export function PartyCard({
   party,
   membersById,
+  partySize,
   onRename,
   onToggleLock,
   onRemoveMember,
   persistenceEnabled,
-  noHealer = false,
+  missing = [],
 }: {
   party: Party;
   membersById: Map<string, Member>;
+  partySize: number;
   onRename: (partyId: string, name: string) => void;
   onToggleLock: (partyId: string, index: number) => void;
   onRemoveMember: (partyId: string, memberId: string) => void;
   persistenceEnabled: boolean;
-  noHealer?: boolean;
+  // Required classNames this party is currently MISSING (empty = meets all).
+  missing?: string[];
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(party.name);
@@ -115,13 +118,10 @@ export function PartyCard({
   // departed member not yet pruned by the server-side reconcile), render the
   // slot as empty rather than a broken chip. The prune (data.ts) is the primary
   // mechanism that removes such ids; this guard just avoids any crash window.
-  const slots: (Member | null)[] = Array.from(
-    { length: MAX_PARTY_SLOTS },
-    (_, i) => {
-      const id = party.memberIds[i];
-      return id ? membersById.get(id) ?? null : null;
-    },
-  );
+  const slots: (Member | null)[] = Array.from({ length: partySize }, (_, i) => {
+    const id = party.memberIds[i];
+    return id ? membersById.get(id) ?? null : null;
+  });
 
   function commitRename() {
     setEditing(false);
@@ -130,19 +130,23 @@ export function PartyCard({
     else setDraft(party.name);
   }
 
+  const hasMissing = missing.length > 0;
+
   return (
     <div
       className={[
-        "neon-edge w-full rounded-xl border bg-gradient-to-b from-[#161634] to-[#10101f] p-2.5",
-        noHealer ? "border-amber-400/60" : "border-indigo-400/30",
+        "neon-edge w-full rounded-xl border p-2.5",
+        hasMissing
+          ? "bg-gradient-to-b from-rose-950 to-red-950 border-red-500/70"
+          : "bg-gradient-to-b from-[#161634] to-[#10101f] border-indigo-400/30",
       ].join(" ")}
     >
-      {noHealer && (
+      {hasMissing && (
         <div
           className="mb-2 flex items-center gap-1 rounded bg-amber-500/15 px-2 py-1 text-[10px] font-semibold text-amber-300 ring-1 ring-amber-400/40"
-          title="No Priest could be assigned — healer pool exhausted"
+          title={`Missing required class(es): ${missing.join(", ")}`}
         >
-          ⚠ No Priest
+          ⚠ missing: {missing.join(", ")}
         </div>
       )}
       {/* Header */}
@@ -174,7 +178,7 @@ export function PartyCard({
           </button>
         )}
         <span className="rounded bg-indigo-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-200">
-          {party.memberIds.length}/{MAX_PARTY_SLOTS}
+          {party.memberIds.length}/{partySize}
         </span>
       </div>
 

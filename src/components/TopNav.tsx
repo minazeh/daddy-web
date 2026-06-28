@@ -8,21 +8,25 @@ import { GuildToggle } from "./GuildToggle";
 // The Daddy⇄Mummy toggle lives here too, right-aligned, so it's consistent
 // everywhere. Sits in the `shrink-0` header area of each page's flex-col layout.
 
-export type NavKey = "party" | "raid" | "members";
+export type NavKey = "party" | "raid" | "members" | "settings";
 
 const ITEMS: { key: NavKey; label: string; path: string }[] = [
   { key: "party", label: "Party Setup", path: "/" },
   { key: "raid", label: "Raid Setup", path: "/raids" },
   { key: "members", label: "Member Dashboard", path: "/members" },
+  { key: "settings", label: "Settings", path: "/settings" },
 ];
 
 const BASE_PATH: Record<NavKey, string> = {
   party: "/",
   raid: "/raids",
   members: "/members",
+  settings: "/settings",
 };
 
 export function TopNav({ guild, active }: { guild: Guild; active: NavKey }) {
+  // Settings are GLOBAL — the guild toggle is irrelevant there, so hide it.
+  const showToggle = active !== "settings";
   return (
     <header className="flex shrink-0 flex-wrap items-center gap-2 border-b border-indigo-500/20 bg-[#0c0c1c]/95 px-4 py-2">
       <span className="mr-2 text-sm font-bold tracking-tight text-slate-100">
@@ -31,10 +35,13 @@ export function TopNav({ guild, active }: { guild: Guild; active: NavKey }) {
       <nav className="flex items-center gap-1" aria-label="Primary">
         {ITEMS.map((item) => {
           const isActive = item.key === active;
+          // Settings is global; its link carries no guild param.
+          const href =
+            item.key === "settings" ? item.path : `${item.path}?guild=${guild}`;
           return (
             <Link
               key={item.key}
-              href={`${item.path}?guild=${guild}`}
+              href={href}
               aria-current={isActive ? "page" : undefined}
               className={[
                 "rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
@@ -48,10 +55,12 @@ export function TopNav({ guild, active }: { guild: Guild; active: NavKey }) {
           );
         })}
       </nav>
-      <div className="ml-auto">
-        {/* Toggle keeps you on the CURRENT page (basePath from active). */}
-        <GuildToggle active={guild} basePath={BASE_PATH[active]} />
-      </div>
+      {showToggle && (
+        <div className="ml-auto">
+          {/* Toggle keeps you on the CURRENT page (basePath from active). */}
+          <GuildToggle active={guild} basePath={BASE_PATH[active]} />
+        </div>
+      )}
     </header>
   );
 }

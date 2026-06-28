@@ -1,4 +1,11 @@
-import type { Member, MemberMeta, Party, RaidGroup } from "./types";
+import {
+  DEFAULT_SETTINGS,
+  type Member,
+  type MemberMeta,
+  type Party,
+  type RaidGroup,
+  type Settings,
+} from "./types";
 
 // Local-dev fallback data, used ONLY when MONGODB_URI is unset so the
 // dashboard renders something to drag around without a live database.
@@ -33,7 +40,16 @@ export const MOCK_PARTIES: Party[] = [
 declare global {
   var _mockRaidGroups: RaidGroup[] | undefined;
   var _mockMemberMeta: Map<string, MemberMeta> | undefined;
+  var _mockSettings: { value: Settings } | undefined;
 }
+
+// Mutable in-memory settings store for mock mode (globalThis-cached). Seeded
+// from DEFAULT_SETTINGS so the no-DB path behaves identically to a fresh DB.
+export const MOCK_SETTINGS: { value: Settings } =
+  globalThis._mockSettings ??
+  (globalThis._mockSettings = {
+    value: { ...DEFAULT_SETTINGS, updatedAt: now },
+  });
 export const MOCK_RAID_GROUPS: RaidGroup[] =
   globalThis._mockRaidGroups ?? (globalThis._mockRaidGroups = []);
 

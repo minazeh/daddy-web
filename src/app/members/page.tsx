@@ -1,4 +1,4 @@
-import { getMembersForManagement, getParties } from "@/lib/data";
+import { getMembersForManagement, getParties, getSettings } from "@/lib/data";
 import { isMongoConfigured } from "@/lib/mongo";
 import { MembersDashboard } from "@/components/MembersDashboard";
 import { DEFAULT_GUILD, isGuild, type Guild } from "@/lib/types";
@@ -20,9 +20,10 @@ export default async function MembersPage({
   const { guild: guildParam } = await searchParams;
   const guild: Guild = isGuild(guildParam) ? guildParam : DEFAULT_GUILD;
 
-  const [managed, parties] = await Promise.all([
+  const [managed, parties, settings] = await Promise.all([
     getMembersForManagement(guild),
     getParties(guild),
+    getSettings(),
   ]);
 
   // `assignedMemberIds` = userIds currently sitting in a party (for Assigned vs
@@ -36,6 +37,7 @@ export default async function MembersPage({
       members={managed}
       partyCount={parties.length}
       assignedMemberIds={assignedMemberIds}
+      settings={settings}
       persistenceEnabled={isMongoConfigured}
     />
   );

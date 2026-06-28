@@ -46,7 +46,7 @@ export function PartyChip({
       className={[
         "flex cursor-grab touch-none items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm select-none active:cursor-grabbing",
         noPriest
-          ? "border-amber-400/50 bg-amber-950/20"
+          ? "border-red-500/70 bg-rose-950"
           : "border-indigo-400/30 bg-indigo-950/60",
         "text-slate-100 backdrop-blur-sm",
         isDragging && !overlay ? "opacity-30" : "",

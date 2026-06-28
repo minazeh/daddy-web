@@ -3,18 +3,24 @@
 import { randomUUID } from "node:crypto";
 import { revalidatePath } from "next/cache";
 import { getDb, isMongoConfigured } from "./mongo";
-import { getMembers, getParties, getPowerMap, getRaidGroups } from "./data";
-import { MOCK_MEMBER_META, MOCK_RAID_GROUPS } from "./mock";
 import {
-  MAX_PARTY_SLOTS,
-  isHealer,
+  getMembers,
+  getParties,
+  getPowerMap,
+  getRaidGroups,
+  getSettings,
+} from "./data";
+import { MOCK_MEMBER_META, MOCK_RAID_GROUPS, MOCK_SETTINGS } from "./mock";
+import {
   normalizePower,
-  roleForClass,
+  roleFor,
+  validateSettings,
   type Field,
   type Guild,
   type Member,
   type Party,
   type RaidGroup,
+  type Settings,
 } from "./types";
 
 // Server actions that mutate the `parties` collection (db `discordbot`).
@@ -36,15 +42,16 @@ const NOT_CONFIGURED: ActionResult = {
   message: "MONGODB_URI is not set — changes are not persisted.",
 };
 
-// Persist a party's slot assignments (auto-saved on every drag).
+// Persist a party's slot assignments (auto-saved on every drag). The slot cap
+// is now settings.partySize (was a hardcoded 5).
 export async function updateParty(
   partyId: string,
   memberIds: string[],
 ): Promise<ActionResult> {
   if (!isMongoConfigured) return NOT_CONFIGURED;
 
-  // Enforce slot cap + dedupe defensively on the server.
-  const deduped = Array.from(new Set(memberIds)).slice(0, MAX_PARTY_SLOTS);
+  const { partySize } = await getSettings();
+  const deduped = Array.from(new Set(memberIds)).slice(0, partySize);
   const db = await getDb();
   await db.collection(PARTIES).updateOne(
     { partyId },
@@ -61,8 +68,9 @@ export async function setPartyLocks(
 ): Promise<ActionResult> {
   if (!isMongoConfigured) return NOT_CONFIGURED;
 
+  const { partySize } = await getSettings();
   const cleaned = Array.from(new Set(lockedSlots)).filter(
-    (i) => Number.isInteger(i) && i >= 0 && i < MAX_PARTY_SLOTS,
+    (i) => Number.isInteger(i) && i >= 0 && i < partySize,
   );
   const db = await getDb();
   await db.collection(PARTIES).updateOne(
@@ -106,19 +114,17 @@ function shuffle<T>(arr: T[]): T[] {
   return arr;
 }
 
-// The slot layout for a party during generation: a fixed-length (5) array where
-// LOCKED indexes keep their existing member (or stay empty), and UNLOCKED
-// indexes are the ones we (re)fill.
+// The slot layout for a party during generation: a fixed-length (partySize)
+// array where LOCKED indexes keep their existing member (or stay empty), and
+// UNLOCKED indexes are the ones we (re)fill.
 interface PartyPlan {
   partyId: string;
   field: Field; // "main" (elite tier) | "sub" — Main is staffed first
-  slots: (string | null)[]; // length MAX_PARTY_SLOTS; userId or null
+  slots: (string | null)[]; // length partySize; userId or null
   locked: Set<number>;
-  // True if the party already contains a Priest among its RETAINED members
-  // (after unlocked slots are cleared, that means a locked Priest). This is the
-  // SAME live class-based check the badge/toolbar use; a party that already has
-  // a Priest is not given another and is not flagged.
-  hasPriest: boolean;
+  // Count of RETAINED (locked) members of each className, so we know which
+  // required-class minimums are still unmet after locks.
+  classCounts: Map<string, number>;
 }
 
 // Persist every party's slots (compacted to memberIds, preserving order so a
@@ -142,60 +148,66 @@ function slotsToMemberIds(slots: (string | null)[]): string[] {
 }
 
 // Build the per-party plan from current parties: which slots are locked, which
-// (locked) members are pinned, and whether the party already contains a Priest
-// among its retained (locked) members.
-function buildPlans(parties: Party[], memberById: Map<string, Member>): PartyPlan[] {
+// (locked) members are pinned, and a count of retained members per className
+// (so we know which required-class minimums are already met by locked members).
+function buildPlans(
+  parties: Party[],
+  memberById: Map<string, Member>,
+  partySize: number,
+): PartyPlan[] {
   return parties.map((p) => {
     const locked = new Set(p.lockedSlots);
     const slots: (string | null)[] = Array.from(
-      { length: MAX_PARTY_SLOTS },
+      { length: partySize },
       (_, i) => p.memberIds[i] ?? null,
     );
-    // Unlocked slots start empty (their members return to the pool).
-    for (let i = 0; i < MAX_PARTY_SLOTS; i++) {
+    // Unlocked slots start empty (their members return to the pool). Slots
+    // beyond partySize are already excluded by the Array length above.
+    for (let i = 0; i < partySize; i++) {
       if (!locked.has(i)) slots[i] = null;
     }
-    // Live class-based Priest check over the RETAINED (non-null) members.
-    const hasPriest = slots.some(
-      (uid) => uid !== null && isHealer(memberById.get(uid)?.className ?? null),
-    );
-    return { partyId: p.partyId, field: p.field, slots, locked, hasPriest };
+    const classCounts = new Map<string, number>();
+    for (const uid of slots) {
+      if (!uid) continue;
+      const cls = memberById.get(uid)?.className ?? null;
+      if (cls) classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
+    }
+    return { partyId: p.partyId, field: p.field, slots, locked, classCounts };
   });
 }
 
-// Core generation — POWER-AWARE, TWO-TIER (Main = elite, Sub = the rest).
-// Mutates plans' slots. Returns the set of partyIds left WITHOUT a healer.
+// Core generation — POWER-AWARE, TWO-TIER (Main = elite, Sub = the rest),
+// SETTINGS-DRIVEN. Mutates plans' slots. Returns a map partyId → missing
+// required classNames (empty/absent = party meets all requirements).
 //
-// Rules (after locks; locked members + locked Priests are fixed and count
-// toward their party from the start):
-//   1. PRIEST hard rule, power-based + Main-first: priestless parties get a
-//      Priest, sorted by power DESC, MAIN parties first then SUB — so the
-//      strongest non-locked Priests anchor Main. A LOCKED Priest counts as
-//      present and is not reassigned. Parties left without one are flagged.
-//   2. TIER PARTITION: rank the remaining available members by power DESC and
-//      give the top ones to MAIN (up to Main's remaining free-slot capacity);
-//      the rest go to SUB. Net: Main's pool outpowers Sub's.
+// Rules (after locks; locked members count toward their party from the start):
+//   1. REQUIREMENTS hard rule, power-based + Main-first: for each required class
+//      (className, min), parties still short get members of that class — sorted
+//      by power DESC, MAIN parties first then SUB. Locked members of that class
+//      already count. Parties that can't be satisfied are flagged with the
+//      class(es) still missing.
+//   2. TIER PARTITION: rank the remaining available members by power DESC; the
+//      top fill MAIN up to its remaining free-slot capacity; rest → SUB.
 //   3. PER-FIELD BALANCE: within Main's parties (and separately within Sub's),
-//      do a ~1-tank pass then a largest-into-smallest-bin balance fill from that
-//      field's tier pool — so each tier is internally even, NOT stacked into
-//      party 1. Main is never balanced against Sub (Main is intentionally
-//      stronger).
-// Randomness applies ONLY to ties (equal-power members shuffle); the
-// power-priority ordering is otherwise deterministic, so reruns are similar by
-// design (Main consistently gets the best).
+//      a ~1-tank pass (using settings classRoles) then a largest-into-smallest-
+//      bin balance fill from that field's tier pool. Main is never balanced
+//      against Sub.
+// Randomness applies ONLY to ties (equal-power members shuffle).
 function generatePlans(
   plans: PartyPlan[],
   pool: Member[],
   powerOf: (uid: string) => number,
-): Set<string> {
-  // Sort by power DESC; equal-power runs shuffled (ties only).
+  classOf: (uid: string) => string | null,
+  settings: Settings,
+): Map<string, string[]> {
+  const { requiredClasses, classRoles } = settings;
   const byPowerDesc = (list: Member[]) =>
     shuffle(list.slice()).sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
 
   const used = new Set<string>();
   const freeSlots = (plan: PartyPlan): number[] => {
     const out: number[] = [];
-    for (let i = 0; i < MAX_PARTY_SLOTS; i++) {
+    for (let i = 0; i < plan.slots.length; i++) {
       if (!plan.locked.has(i) && plan.slots[i] === null) out.push(i);
     }
     return out;
@@ -204,10 +216,11 @@ function generatePlans(
     const free = freeSlots(plan);
     if (free.length === 0) return false;
     plan.slots[free[0]] = uid;
+    const cls = classOf(uid);
+    if (cls) plan.classCounts.set(cls, (plan.classCounts.get(cls) ?? 0) + 1);
     return true;
   };
 
-  // Running power per party (seeded with locked/existing members).
   const power = new Map<string, number>();
   for (const plan of plans) {
     let sum = 0;
@@ -217,8 +230,6 @@ function generatePlans(
   const addPower = (plan: PartyPlan, uid: string) =>
     power.set(plan.partyId, (power.get(plan.partyId) ?? 0) + powerOf(uid));
 
-  // Lowest-power open party AMONG a given subset (a single field's plans).
-  // Ties broken by partyId for determinism.
   const lowestOpenIn = (
     subset: PartyPlan[],
     pred?: (p: PartyPlan) => boolean,
@@ -252,31 +263,42 @@ function generatePlans(
 
   const mainPlans = plans.filter((p) => p.field === "main");
   const subPlans = plans.filter((p) => p.field === "sub");
-  const noHealer = new Set<string>();
 
-  // ---- STEP 1: PRIEST hard rule, power DESC, MAIN parties first then SUB. ----
-  const healers = byPowerDesc(pool.filter((m) => isHealer(m.className)));
-  const assignPriests = (subset: PartyPlan[]) => {
-    const need = subset.filter((p) => !p.hasPriest).length;
-    for (let k = 0; k < need; k++) {
-      const target = lowestOpenIn(
-        subset,
-        (p) => !p.hasPriest && freeSlots(p).length > 0,
-      );
-      if (!target) break;
-      const h = takeNext(healers); // strongest remaining Priest
-      if (!h) break;
-      place(target, h.userId);
-      addPower(target, h.userId);
-      target.hasPriest = true;
-    }
-  };
-  assignPriests(mainPlans); // Main anchored first by the strongest Priests
-  assignPriests(subPlans);
-  for (const plan of plans) if (!plan.hasPriest) noHealer.add(plan.partyId);
+  // ---- STEP 1: REQUIRED CLASSES, power DESC, Main parties first then Sub. ----
+  // Process each requirement; for its min, top up parties still short.
+  const needsClass = (plan: PartyPlan, cls: string, min: number) =>
+    (plan.classCounts.get(cls) ?? 0) < min && freeSlots(plan).length > 0;
+  for (const rc of requiredClasses) {
+    const pool_c = byPowerDesc(
+      pool.filter((m) => m.className === rc.className && !used.has(m.userId)),
+    );
+    const assignTo = (subset: PartyPlan[]) => {
+      // Keep going until no short party can be filled or the class pool dries.
+      let guard = subset.length * rc.min + 1;
+      while (guard-- > 0) {
+        const target = lowestOpenIn(subset, (p) =>
+          needsClass(p, rc.className, rc.min),
+        );
+        if (!target) break;
+        const m = takeNext(pool_c);
+        if (!m) break;
+        place(target, m.userId);
+        addPower(target, m.userId);
+      }
+    };
+    assignTo(mainPlans);
+    assignTo(subPlans);
+  }
+  // Flag parties still missing any required class.
+  const missing = new Map<string, string[]>();
+  for (const plan of plans) {
+    const miss = requiredClasses
+      .filter((rc) => (plan.classCounts.get(rc.className) ?? 0) < rc.min)
+      .map((rc) => rc.className);
+    if (miss.length > 0) missing.set(plan.partyId, miss);
+  }
 
-  // ---- STEP 2: TIER PARTITION of the remaining (non-priest-assigned) pool. ----
-  // Highest-power remainder fills MAIN up to its free capacity; rest → SUB.
+  // ---- STEP 2: TIER PARTITION of the remaining pool. ----
   const remaining = byPowerDesc(pool.filter((m) => !used.has(m.userId)));
   const mainCapacity = mainPlans.reduce((s, p) => s + freeSlots(p).length, 0);
   const mainPool = remaining.slice(0, mainCapacity);
@@ -301,18 +323,17 @@ function generatePlans(
     for (let k = 0; k < subset.length; k++) {
       const target = lowestOpenIn(subset);
       if (!target) break;
-      const t = take((m) => roleForClass(m.className) === "tank");
+      const t = take((m) => roleFor(m.className, classRoles) === "tank");
       if (!t) break;
       place(target, t.userId);
       addPower(target, t.userId);
     }
 
-    // Balance fill: strongest remaining (this field's pool) → lowest-power open
-    // party in this field. Largest-into-smallest-bin keeps the tier even.
+    // Balance fill: strongest remaining → lowest-power open party in this field.
     for (const m of fieldPool) {
       if (localUsed.has(m.userId) || used.has(m.userId)) continue;
       const target = lowestOpenIn(subset);
-      if (!target) break; // no free slots left in this field
+      if (!target) break;
       localUsed.add(m.userId);
       used.add(m.userId);
       place(target, m.userId);
@@ -322,7 +343,7 @@ function generatePlans(
   fillField(mainPlans, mainPool);
   fillField(subPlans, subPool);
 
-  return noHealer;
+  return missing;
 }
 
 export interface BulkResult extends ActionResult {
@@ -330,24 +351,28 @@ export interface BulkResult extends ActionResult {
 }
 
 export interface GenerateResult extends BulkResult {
-  partiesWithoutHealer?: string[];
+  // partyId → required classNames the party is still missing (for flagging).
+  partiesMissing?: Record<string, string[]>;
 }
 
 // GENERATE: auto-assign unlocked slots for the current guild's parties (both
 // fields). Preserves locked slots; no member appears in two parties; respects
-// the 5-slot cap. Persists all assignments.
+// settings.partySize. Persists all assignments. Hard rule + role-spread come
+// from settings (requiredClasses / classRoles).
 export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   if (!isMongoConfigured) return NOT_CONFIGURED;
 
-  const [members, parties, powerMap] = await Promise.all([
+  const [members, parties, powerMap, settings] = await Promise.all([
     getMembers(guild), // ACTIVE members only (present in `members`)
     getParties(guild),
     getPowerMap(guild),
+    getSettings(),
   ]);
   const memberById = new Map(members.map((m) => [m.userId, m]));
   const powerOf = (uid: string) => powerMap.get(uid) ?? 0;
+  const classOf = (uid: string) => memberById.get(uid)?.className ?? null;
 
-  const plans = buildPlans(parties, memberById);
+  const plans = buildPlans(parties, memberById, settings.partySize);
 
   // Available pool = guild members NOT pinned in any locked slot.
   const pinned = new Set<string>();
@@ -359,7 +384,7 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   }
   const pool = members.filter((m) => !pinned.has(m.userId));
 
-  const noHealer = generatePlans(plans, pool, powerOf);
+  const missing = generatePlans(plans, pool, powerOf, classOf, settings);
 
   // Persist. Compact each plan's slots to a memberIds array. To preserve lock
   // index alignment, we write the slots array with trailing nulls trimmed but
@@ -400,7 +425,7 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   return {
     ok: true,
     parties: fresh,
-    partiesWithoutHealer: Array.from(noHealer),
+    partiesMissing: Object.fromEntries(missing),
   };
 }
 
@@ -409,14 +434,17 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
 export async function resetGuild(guild: Guild): Promise<BulkResult> {
   if (!isMongoConfigured) return NOT_CONFIGURED;
 
-  const parties = await getParties(guild);
+  const [parties, settings] = await Promise.all([
+    getParties(guild),
+    getSettings(),
+  ]);
   const db = await getDb();
   const ops = parties.map((p) => {
     const locked = new Set(p.lockedSlots);
     // Keep only members sitting in a locked slot; compact + remap locks.
     const kept: string[] = [];
     const keptLocked: number[] = [];
-    for (let i = 0; i < MAX_PARTY_SLOTS; i++) {
+    for (let i = 0; i < settings.partySize; i++) {
       const uid = p.memberIds[i];
       if (uid && locked.has(i)) {
         keptLocked.push(kept.length);
@@ -690,4 +718,74 @@ export async function setMemberPower(
   revalidatePath("/members");
   revalidatePath("/");
   return { ok: true, userId, power: value };
+}
+
+// ============================================================================
+// SETTINGS — edit the global composition config. Validates (incl. sum-of-mins
+// <= partySize), persists, and — when counts/party-size change — reseeds both
+// guilds' boards (data.ensureGuildParties does the safe reseed: shrink frees
+// members to the pool + cleans raid refs; grow adds blanks; smaller partySize
+// caps overflow). Revalidates every page that reads settings.
+// ============================================================================
+
+const SETTINGS = "settings";
+const SETTINGS_ID = "global";
+
+// Doc shape for the settings collection (string `_id`, not ObjectId).
+interface SettingsDoc {
+  _id: string;
+  requiredClasses?: Settings["requiredClasses"];
+  classRoles?: Settings["classRoles"];
+  partySize?: number;
+  mainPartyCount?: number;
+  subPartyCount?: number;
+  updatedAt?: Date;
+}
+
+export interface SettingsResult extends ActionResult {
+  settings?: Settings;
+}
+
+export async function updateSettings(next: Settings): Promise<SettingsResult> {
+  const v = validateSettings(next);
+  if (!v.ok) return { ok: false, message: v.error };
+  const s = v.settings;
+
+  const prev = await getSettings();
+  const structuralChange =
+    prev.partySize !== s.partySize ||
+    prev.mainPartyCount !== s.mainPartyCount ||
+    prev.subPartyCount !== s.subPartyCount;
+
+  if (!isMongoConfigured) {
+    MOCK_SETTINGS.value = s;
+  } else {
+    const db = await getDb();
+    await db.collection<SettingsDoc>(SETTINGS).updateOne(
+      { _id: SETTINGS_ID },
+      {
+        $set: {
+          requiredClasses: s.requiredClasses,
+          classRoles: s.classRoles,
+          partySize: s.partySize,
+          mainPartyCount: s.mainPartyCount,
+          subPartyCount: s.subPartyCount,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true },
+    );
+  }
+
+  // A structural change reseeds both guilds (safe + idempotent). Counts/size are
+  // global, so reseed daddy AND mummy.
+  if (structuralChange) {
+    await Promise.all([getParties("daddy"), getParties("mummy")]);
+  }
+
+  revalidatePath("/settings");
+  revalidatePath("/");
+  revalidatePath("/members");
+  revalidatePath("/raids");
+  return { ok: true, settings: s };
 }

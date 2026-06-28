@@ -2,12 +2,13 @@
 
 import { useMemo, useState, useTransition } from "react";
 import {
-  CLASS_ROLE,
+  KNOWN_CLASSES,
   normalizePower,
-  roleForClass,
+  roleFor,
   type Guild,
   type ManagedMember,
   type Role,
+  type Settings,
 } from "@/lib/types";
 import { setMemberPower } from "@/lib/actions";
 import { TopNav } from "./TopNav";
@@ -23,17 +24,6 @@ import { TopNav } from "./TopNav";
 // The sort control defaults to "Name A→Z" (a single deterministic order applied
 // identically on the server + first client render); changing it re-sorts on the
 // client only.
-
-const KNOWN_CLASSES = [
-  "Assassin",
-  "Hunter",
-  "Knight",
-  "Priest",
-  "Gunslinger",
-  "Blacksmith",
-  "Wizard",
-  "Druid",
-];
 
 const ROLE_LABEL: Record<Role, string> = {
   tank: "Tank",
@@ -127,12 +117,14 @@ export function MembersDashboard({
   members: initial,
   partyCount,
   assignedMemberIds,
+  settings,
   persistenceEnabled,
 }: {
   guild: Guild;
   members: ManagedMember[];
   partyCount: number;
   assignedMemberIds: string[];
+  settings: Settings;
   persistenceEnabled: boolean;
 }) {
   const [members, setMembers] = useState<ManagedMember[]>(initial);
@@ -200,15 +192,19 @@ export function MembersDashboard({
     const rated = active.filter((m) => m.power > 0).length;
     const unrated = active.length - rated;
 
-    // Per-class rows (8 known + Unknown/none), from ACTIVE members.
-    const classKeys = [...KNOWN_CLASSES, "Unknown/none"];
+    // Per-class rows (8 known + Unknown/none), from ACTIVE members. Roles come
+    // from settings.classRoles.
+    const known = KNOWN_CLASSES as readonly string[];
+    const classKeys = [...known, "Unknown/none"];
     const perClass = classKeys.map((cls) => {
       const isUnknown = cls === "Unknown/none";
       const rows = active.filter((m) =>
-        isUnknown ? !m.className || !KNOWN_CLASSES.includes(m.className) : m.className === cls,
+        isUnknown
+          ? !m.className || !known.includes(m.className)
+          : m.className === cls,
       );
       const powers = rows.map((m) => m.power);
-      const role: Role = isUnknown ? "dps" : (CLASS_ROLE[cls] ?? "dps");
+      const role: Role = isUnknown ? "dps" : roleFor(cls, settings.classRoles);
       return {
         cls,
         role,
@@ -236,9 +232,10 @@ export function MembersDashboard({
       count: active.filter((m) => b.test(m.power)).length,
     }));
 
-    // Role split (Tank/Healer/DPS) from ACTIVE members.
+    // Role split (Tank/Healer/DPS) from ACTIVE members (settings.classRoles).
     const roleSplit: Record<Role, number> = { tank: 0, healer: 0, dps: 0 };
-    for (const m of active) roleSplit[roleForClass(m.className)]++;
+    for (const m of active)
+      roleSplit[roleFor(m.className, settings.classRoles)]++;
 
     // Top 10 by power (active), then needs-rating (active, power 0).
     const byNameThenId = (x: ManagedMember, y: ManagedMember) => {
@@ -267,7 +264,7 @@ export function MembersDashboard({
       top10,
       needsRating,
     };
-  }, [members, assignedSet]);
+  }, [members, assignedSet, settings.classRoles]);
 
   function handleSavePower(userId: string, power: number) {
     const value = normalizePower(power);

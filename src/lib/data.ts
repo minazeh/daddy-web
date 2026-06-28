@@ -7,11 +7,13 @@ import {
   MOCK_MEMBER_META,
   MOCK_PARTIES,
   MOCK_RAID_GROUPS,
+  MOCK_SETTINGS,
 } from "./mock";
 import {
+  DEFAULT_SETTINGS,
   FIELDS,
   FIELD_LABEL,
-  FIELD_SIZE,
+  KNOWN_CLASSES,
   partyIdFor,
   type Field,
   type Guild,
@@ -20,6 +22,8 @@ import {
   type MemberMeta,
   type Party,
   type RaidGroup,
+  type Role,
+  type Settings,
 } from "./types";
 
 // Server-side data access layer.
@@ -274,6 +278,90 @@ export async function getPowerMap(guild: Guild): Promise<Map<string, number>> {
   return map;
 }
 
+// ---- Settings: web-owned single GLOBAL config doc ----
+
+const SETTINGS = "settings";
+const SETTINGS_ID = "global";
+
+interface SettingsDoc {
+  _id?: string;
+  requiredClasses?: { className: string; min: number }[];
+  classRoles?: Record<string, Role>;
+  partySize?: number;
+  mainPartyCount?: number;
+  subPartyCount?: number;
+  updatedAt?: Date | string;
+}
+
+function serializeSettings(d: SettingsDoc | null): Settings {
+  if (!d) return { ...DEFAULT_SETTINGS, updatedAt: new Date(0).toISOString() };
+  // Normalize defensively (fill any missing class role, coerce numbers).
+  const classRoles: Record<string, Role> = {};
+  for (const cls of KNOWN_CLASSES) {
+    const r = d.classRoles?.[cls];
+    classRoles[cls] = r === "tank" || r === "healer" || r === "dps" ? r : "dps";
+  }
+  const requiredClasses = Array.isArray(d.requiredClasses)
+    ? d.requiredClasses
+        .filter(
+          (rc) =>
+            rc &&
+            (KNOWN_CLASSES as readonly string[]).includes(rc.className) &&
+            Number.isFinite(rc.min) &&
+            rc.min >= 1,
+        )
+        .map((rc) => ({ className: rc.className, min: Math.round(rc.min) }))
+    : DEFAULT_SETTINGS.requiredClasses;
+  return {
+    requiredClasses,
+    classRoles,
+    partySize:
+      typeof d.partySize === "number" && d.partySize >= 1
+        ? Math.round(d.partySize)
+        : DEFAULT_SETTINGS.partySize,
+    mainPartyCount:
+      typeof d.mainPartyCount === "number" && d.mainPartyCount >= 0
+        ? Math.round(d.mainPartyCount)
+        : DEFAULT_SETTINGS.mainPartyCount,
+    subPartyCount:
+      typeof d.subPartyCount === "number" && d.subPartyCount >= 0
+        ? Math.round(d.subPartyCount)
+        : DEFAULT_SETTINGS.subPartyCount,
+    updatedAt: toIso(d.updatedAt),
+  };
+}
+
+// Read the global settings, seeding DEFAULT_SETTINGS on first access (idempotent
+// upsert via $setOnInsert — re-running never overwrites edited values). Mock
+// mode reads the in-memory store.
+export async function getSettings(): Promise<Settings> {
+  if (!isMongoConfigured) return { ...MOCK_SETTINGS.value };
+
+  const db = await getDb();
+  const col = db.collection<SettingsDoc>(SETTINGS);
+  await col.updateOne(
+    { _id: SETTINGS_ID },
+    {
+      $setOnInsert: {
+        requiredClasses: DEFAULT_SETTINGS.requiredClasses,
+        classRoles: DEFAULT_SETTINGS.classRoles,
+        partySize: DEFAULT_SETTINGS.partySize,
+        mainPartyCount: DEFAULT_SETTINGS.mainPartyCount,
+        subPartyCount: DEFAULT_SETTINGS.subPartyCount,
+        updatedAt: new Date(),
+      },
+    },
+    { upsert: true },
+  );
+  const doc = await col.findOne({ _id: SETTINGS_ID });
+  return serializeSettings(doc);
+}
+
+// Party count for a field from settings.
+export function fieldCount(s: Settings, field: Field): number {
+  return field === "main" ? s.mainPartyCount : s.subPartyCount;
+}
+
 // Total-order comparator for parties: by field (main before sub), then
 // position, then unique partyId tiebreaker.
 function comparePartiesByOrder(a: Party, b: Party): number {
@@ -299,26 +387,34 @@ function blankParty(guild: Guild, field: Field, position: number): Party {
   };
 }
 
-// Idempotently guarantee the fixed field structure for ONE guild:
-// EXACTLY 12 Main + 18 Sub blank parties, keyed by the deterministic id
-// `${type}-${field}-${position}`. Returns the canonical set (sorted).
+// Idempotently guarantee the field structure for ONE guild: exactly
+// settings.mainPartyCount Main + settings.subPartyCount Sub blank parties,
+// keyed by `${type}-${field}-${position}`. Returns the canonical set (sorted).
 //
-// Migration of pre-existing data: any party doc for this guild that is NOT one
-// of the canonical (type, field, position) ids is removed — this folds the old
-// ad-hoc field-less test parties into the canonical set cleanly with no strays
-// or dupes. Member assignments on a canonical id are preserved across reloads
-// (we only insert MISSING canonical ids; we never overwrite existing ones).
+// SAFE RESEED on settings change (counts / party size):
+//   - Counts SHRINK   → out-of-range parties are deleted; their members simply
+//     return to the pool (members live in `members`, never deleted); raid-group
+//     references to deleted parties are cleaned up.
+//   - Counts GROW     → missing blank parties are inserted ($setOnInsert keeps
+//     existing assignments untouched).
+//   - partySize SHRINKS → reconcile caps each party's memberIds + lockedSlots to
+//     partySize, freeing overflow members to the pool.
+// Idempotent + race-safe (unique partyId index + upsert/$setOnInsert).
 export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
+  const settings = await getSettings();
+  const counts: Record<Field, number> = {
+    main: settings.mainPartyCount,
+    sub: settings.subPartyCount,
+  };
+
   if (!isMongoConfigured) {
     // Mock mode: synthesize the canonical structure in memory (no DB writes).
     const out: Party[] = [];
     for (const field of FIELDS) {
-      for (let i = 0; i < FIELD_SIZE[field]; i++) {
+      for (let i = 0; i < counts[field]; i++) {
         out.push(blankParty(guild, field, i));
       }
     }
-    // Fold any mock member assignments onto matching canonical ids, pruning any
-    // id not in the mock roster (mirrors the live reconcile).
     const valid = new Set(
       MOCK_MEMBERS.filter((m) => (guild === "daddy" ? m.isMain : m.isSub)).map(
         (m) => m.userId,
@@ -326,7 +422,11 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
     );
     for (const m of MOCK_PARTIES) {
       const hit = out.find((p) => p.partyId === m.partyId);
-      if (hit) hit.memberIds = m.memberIds.filter((id) => valid.has(id));
+      if (hit) {
+        hit.memberIds = m.memberIds
+          .filter((id) => valid.has(id))
+          .slice(0, settings.partySize);
+      }
     }
     return out.sort(comparePartiesByOrder);
   }
@@ -334,34 +434,41 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
   const db = await getDb();
   const col = db.collection<PartyDoc>(PARTIES);
 
-  // Unique index on partyId makes the upsert seed race-safe: concurrent server
-  // renders of the dynamic route (SSR + RSC passes) can't create duplicates.
-  // Idempotent to create.
+  // Unique index on partyId makes the upsert seed race-safe.
   await col.createIndex({ partyId: 1 }, { unique: true });
 
-  // Canonical id set for this guild.
+  // Canonical id set for this guild (from settings counts).
   const canonical = new Set<string>();
   for (const field of FIELDS) {
-    for (let i = 0; i < FIELD_SIZE[field]; i++) {
+    for (let i = 0; i < counts[field]; i++) {
       canonical.add(partyIdFor(guild, field, i));
     }
   }
 
-  // Remove strays (any guild doc whose id isn't canonical — old test rows or
-  // an earlier non-atomic seed's duplicate-keyed rows can't exist now, but a
-  // pre-existing non-canonical row would; fold them out).
-  await col.deleteMany({
-    type: guild,
-    partyId: { $nin: Array.from(canonical) },
-  });
+  // Find non-canonical (out-of-range / stray) parties for this guild BEFORE
+  // deleting, so we can clean raid-group references to them.
+  const strayDocs = await col
+    .find({ type: guild, partyId: { $nin: Array.from(canonical) } })
+    .project<{ partyId: string }>({ partyId: 1, _id: 0 })
+    .toArray();
+  const strayIds = strayDocs.map((d) => d.partyId);
+  if (strayIds.length > 0) {
+    await col.deleteMany({ type: guild, partyId: { $in: strayIds } });
+    // Clean raid-group references to the removed parties (they just leave their
+    // raid group; raid groups + members are untouched).
+    await db.collection<RaidGroupDoc>(RAID_GROUPS).updateMany(
+      { type: guild, partyIds: { $in: strayIds } },
+      {
+        $pull: { partyIds: { $in: strayIds } },
+        $set: { updatedAt: new Date() },
+      } as never,
+    );
+  }
 
-  // Upsert each canonical blank. `$setOnInsert` only writes on CREATE, so an
-  // existing party's member assignments / locks are never overwritten. Two
-  // concurrent upserts on the same unique partyId collapse to one row (the
-  // second no-ops) — naturally idempotent and race-safe.
+  // Upsert each canonical blank ($setOnInsert preserves existing assignments).
   const ops = [];
   for (const field of FIELDS) {
-    for (let i = 0; i < FIELD_SIZE[field]; i++) {
+    for (let i = 0; i < counts[field]; i++) {
       const p = blankParty(guild, field, i);
       ops.push({
         updateOne: {
@@ -385,7 +492,7 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
       });
     }
   }
-  await col.bulkWrite(ops, { ordered: false });
+  if (ops.length > 0) await col.bulkWrite(ops, { ordered: false });
 
   // Read back the canonical set, correcting field/position from the id for any
   // legacy canonical-id doc that predated the `field` column.
@@ -397,41 +504,39 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
     .sort(comparePartiesByOrder);
 
   // Reconcile against the live roster: prune userIds that are no longer in this
-  // guild's `members` (departed / de-roled — the bot's removeStale dropped them
-  // from the pool, but their id can linger in a party). Idempotent: writes back
-  // only parties that actually changed.
+  // guild's `members`, AND cap each party to settings.partySize (a shrunk party
+  // size frees overflow members to the pool). Idempotent: writes only changed
+  // parties.
   const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
-  return reconcileParties(col, parties, validIds);
+  return reconcileParties(col, parties, validIds, settings.partySize);
 }
 
-// Remove any memberId not in `validIds` from each party's memberIds, and if a
-// pruned member sat in a LOCKED slot, drop that index from lockedSlots too (the
-// pinned member is gone → free + unlock the slot). Persists ONLY changed
-// parties (no-op writes otherwise). Returns the pruned, in-memory party list so
-// the caller doesn't need a re-read. Race-safe: each write is an idempotent
-// $set keyed on the unique partyId; concurrent identical prunes converge.
+// Remove any memberId not in `validIds` from each party's memberIds; cap to
+// `partySize` (overflow members return to the pool); and if a removed member
+// sat in a LOCKED slot, drop that index from lockedSlots too (locks reference
+// slot indexes into the compacting memberIds). Persists ONLY changed parties.
+// Race-safe: each write is an idempotent $set keyed on the unique partyId.
 async function reconcileParties(
   col: Collection<PartyDoc>,
   parties: Party[],
   validIds: Set<string>,
+  partySize: number,
 ): Promise<Party[]> {
   const writes: AnyBulkWriteOperation<PartyDoc>[] = [];
 
   const reconciled = parties.map((p) => {
     let changed = false;
-    // Track which surviving members were in a locked slot so we can rebuild
-    // lockedSlots against the COMPACTED memberIds (a removed member shifts
-    // indexes). Locks reference slot indexes into memberIds.
     const lockedSet = new Set(p.lockedSlots);
     const keptLockedUids = new Set<string>();
     const nextMemberIds: string[] = [];
     for (let i = 0; i < p.memberIds.length; i++) {
       const uid = p.memberIds[i];
-      if (validIds.has(uid)) {
+      // Prune departed members AND any overflow beyond partySize.
+      if (validIds.has(uid) && nextMemberIds.length < partySize) {
         if (lockedSet.has(i)) keptLockedUids.add(uid);
         nextMemberIds.push(uid);
       } else {
-        changed = true; // an orphan was pruned (member gone OR its lock dropped)
+        changed = true; // pruned: departed OR over the (possibly shrunk) cap
       }
     }
     if (!changed) return p;

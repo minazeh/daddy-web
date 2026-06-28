@@ -179,8 +179,8 @@ export function isHealer(className: string | null): boolean {
 // SINGLE SOURCE OF TRUTH for Priest-presence. A party "has a Priest" if ANY of
 // its CURRENT members — locked OR unlocked — is a Priest. Computed LIVE from the
 // party's actual `memberIds` (look up each member's className), never from a
-// flag stored at Generate time. Reused by the card badge, the toolbar shortage
-// count, and the Generate hard rule so all three agree.
+// flag stored at Generate time. (Legacy helper — the settings-driven
+// `missingRequiredClasses` below supersedes it.)
 export function partyHasPriest(
   party: Pick<Party, "memberIds">,
   membersById: Map<string, Pick<Member, "className">>,
@@ -188,4 +188,170 @@ export function partyHasPriest(
   return party.memberIds.some((id) =>
     isHealer(membersById.get(id)?.className ?? null),
   );
+}
+
+// ---- Settings (web-owned, single GLOBAL doc) ----
+// Turns the formerly-hardcoded comp rules into editable config:
+//   requiredClasses — every party must contain >= min of each className.
+//   classRoles      — className → comp role (Tank/Healer/DPS).
+//   partySize       — slots per party (was MAX_PARTY_SLOTS = 5).
+//   mainPartyCount / subPartyCount — parties seeded per field (was 12 / 18).
+
+// The 8 known classes (the editable Settings UI offers exactly these).
+export const KNOWN_CLASSES = [
+  "Assassin",
+  "Hunter",
+  "Knight",
+  "Priest",
+  "Gunslinger",
+  "Blacksmith",
+  "Wizard",
+  "Druid",
+] as const;
+
+export const ROLES: Role[] = ["tank", "healer", "dps"];
+
+// DEFAULT class→role map (seeds settings.classRoles; preserves old behavior).
+export const DEFAULT_CLASS_ROLE: Record<string, Role> = { ...CLASS_ROLE };
+
+// Resolve a className to a role using a classRoles map (from settings).
+// Unknown/null className → generic "dps" (flex).
+export function roleFor(
+  className: string | null,
+  classRoles: Record<string, Role>,
+): Role {
+  if (!className) return "dps";
+  return classRoles[className] ?? "dps";
+}
+
+export interface RequiredClass {
+  className: string;
+  min: number; // >= 1
+}
+
+export interface Settings {
+  requiredClasses: RequiredClass[];
+  classRoles: Record<string, Role>;
+  partySize: number;
+  mainPartyCount: number;
+  subPartyCount: number;
+  updatedAt: string; // ISO
+}
+
+// DEFAULTS that preserve today's behavior exactly.
+export const DEFAULT_SETTINGS: Omit<Settings, "updatedAt"> = {
+  requiredClasses: [{ className: "Priest", min: 1 }],
+  classRoles: { ...CLASS_ROLE },
+  partySize: 5,
+  mainPartyCount: 12,
+  subPartyCount: 18,
+};
+
+// Bounds for validation (UI + server action).
+export const PARTY_SIZE_MIN = 1;
+export const PARTY_SIZE_MAX = 10;
+export const PARTY_COUNT_MIN = 0;
+export const PARTY_COUNT_MAX = 60;
+
+// Validate + normalize a full settings object against bounds + invariants.
+// The SUM of requiredClasses mins must be <= partySize (can't require more than
+// fits a party). Returns the normalized settings or an error message.
+export function validateSettings(
+  s: Settings,
+): { ok: true; settings: Settings } | { ok: false; error: string } {
+  const partySize = Math.round(Number(s.partySize));
+  if (
+    !Number.isInteger(partySize) ||
+    partySize < PARTY_SIZE_MIN ||
+    partySize > PARTY_SIZE_MAX
+  ) {
+    return {
+      ok: false,
+      error: `Party size must be ${PARTY_SIZE_MIN}–${PARTY_SIZE_MAX}.`,
+    };
+  }
+  const mainPartyCount = Math.round(Number(s.mainPartyCount));
+  const subPartyCount = Math.round(Number(s.subPartyCount));
+  for (const [label, v] of [
+    ["Main", mainPartyCount],
+    ["Sub", subPartyCount],
+  ] as const) {
+    if (!Number.isInteger(v) || v < PARTY_COUNT_MIN || v > PARTY_COUNT_MAX) {
+      return {
+        ok: false,
+        error: `${label} party count must be ${PARTY_COUNT_MIN}–${PARTY_COUNT_MAX}.`,
+      };
+    }
+  }
+  // classRoles: only known classes, valid roles (default dps).
+  const classRoles: Record<string, Role> = {};
+  for (const cls of KNOWN_CLASSES) {
+    const r = s.classRoles?.[cls];
+    classRoles[cls] = r === "tank" || r === "healer" || r === "dps" ? r : "dps";
+  }
+  // requiredClasses: known classes, min >= 1, no dupes, sum(mins) <= partySize.
+  const seen = new Set<string>();
+  const requiredClasses: RequiredClass[] = [];
+  let minSum = 0;
+  for (const rc of s.requiredClasses ?? []) {
+    if (!(KNOWN_CLASSES as readonly string[]).includes(rc.className)) {
+      return { ok: false, error: `Unknown class "${rc.className}".` };
+    }
+    if (seen.has(rc.className)) {
+      return { ok: false, error: `Duplicate required class "${rc.className}".` };
+    }
+    const min = Math.round(Number(rc.min));
+    if (!Number.isInteger(min) || min < 1) {
+      return { ok: false, error: `Min for "${rc.className}" must be >= 1.` };
+    }
+    seen.add(rc.className);
+    requiredClasses.push({ className: rc.className, min });
+    minSum += min;
+  }
+  if (minSum > partySize) {
+    return {
+      ok: false,
+      error: `Required classes need ${minSum} slots but party size is ${partySize}.`,
+    };
+  }
+  return {
+    ok: true,
+    settings: {
+      requiredClasses,
+      classRoles,
+      partySize,
+      mainPartyCount,
+      subPartyCount,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+}
+
+// SINGLE SOURCE OF TRUTH for composition checking. Returns the list of required
+// classNames a party is MISSING (has fewer than `min` of). Empty = meets all.
+// Computed LIVE from the party's actual memberIds (locked OR unlocked), so
+// manual drags/locks update it immediately. Reused by the card badge, the
+// toolbar count, and Generate's hard rule so all three agree.
+export function missingRequiredClasses(
+  party: Pick<Party, "memberIds">,
+  membersById: Map<string, Pick<Member, "className">>,
+  requiredClasses: RequiredClass[],
+): string[] {
+  const counts = new Map<string, number>();
+  for (const id of party.memberIds) {
+    const cls = membersById.get(id)?.className ?? null;
+    if (cls) counts.set(cls, (counts.get(cls) ?? 0) + 1);
+  }
+  return requiredClasses
+    .filter((rc) => (counts.get(rc.className) ?? 0) < rc.min)
+    .map((rc) => rc.className);
+}
+
+// Convenience: does the party meet ALL required-class minimums?
+export function partyMeetsRequirements(
+  party: Pick<Party, "memberIds">,
+  membersById: Map<string, Pick<Member, "className">>,
+  requiredClasses: RequiredClass[],
+): boolean {
+  return missingRequiredClasses(party, membersById, requiredClasses).length === 0;
 }
