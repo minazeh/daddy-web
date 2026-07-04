@@ -8,12 +8,13 @@ import { GuildToggle } from "./GuildToggle";
 // The Daddy⇄Mummy toggle lives here too, right-aligned, so it's consistent
 // everywhere. Sits in the `shrink-0` header area of each page's flex-col layout.
 
-export type NavKey = "party" | "raid" | "members" | "settings";
+export type NavKey = "party" | "raid" | "members" | "attendance" | "settings";
 
 const ITEMS: { key: NavKey; label: string; path: string }[] = [
   { key: "party", label: "Party Setup", path: "/" },
   { key: "raid", label: "Raid Setup", path: "/raids" },
   { key: "members", label: "Member Dashboard", path: "/members" },
+  { key: "attendance", label: "Attendance", path: "/attendance" },
   { key: "settings", label: "Settings", path: "/settings" },
 ];
 
@@ -21,6 +22,7 @@ const BASE_PATH: Record<NavKey, string> = {
   party: "/",
   raid: "/raids",
   members: "/members",
+  attendance: "/attendance",
   settings: "/settings",
 };
 

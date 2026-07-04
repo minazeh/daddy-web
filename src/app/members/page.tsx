@@ -1,4 +1,5 @@
 import { getMembersForManagement, getParties, getSettings } from "@/lib/data";
+import { getAttendanceSessions } from "@/lib/attendance-data";
 import { isMongoConfigured } from "@/lib/mongo";
 import { MembersDashboard } from "@/components/MembersDashboard";
 import { DEFAULT_GUILD, isGuild, type Guild } from "@/lib/types";
@@ -20,10 +21,13 @@ export default async function MembersPage({
   const { guild: guildParam } = await searchParams;
   const guild: Guild = isGuild(guildParam) ? guildParam : DEFAULT_GUILD;
 
-  const [managed, parties, settings] = await Promise.all([
+  const [managed, parties, settings, attendanceSessions] = await Promise.all([
     getMembersForManagement(guild),
     getParties(guild),
     getSettings(),
+    // Completed GvG sessions for this guild (bot-owned, read-only) — backs the
+    // per-member attendance history + since-joined rate in the detail modal.
+    getAttendanceSessions(guild),
   ]);
 
   // `assignedMemberIds` = userIds currently sitting in a party (for Assigned vs
@@ -38,6 +42,7 @@ export default async function MembersPage({
       partyCount={parties.length}
       assignedMemberIds={assignedMemberIds}
       settings={settings}
+      attendanceSessions={attendanceSessions}
       persistenceEnabled={isMongoConfigured}
     />
   );

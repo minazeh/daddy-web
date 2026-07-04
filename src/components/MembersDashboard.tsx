@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useMemo, useState, useTransition } from "react";
 import {
   KNOWN_CLASSES,
@@ -10,6 +11,15 @@ import {
   type Role,
   type Settings,
 } from "@/lib/types";
+import {
+  fmtDateShort,
+  formatRate,
+  guildTrend,
+  memberAttendance,
+  type AttendanceSession,
+  type MemberSessionRow,
+} from "@/lib/attendance";
+import { MemberSessionStrip, STATUS_LABEL } from "./AttendanceCharts";
 import { setMemberPower } from "@/lib/actions";
 import { TopNav } from "./TopNav";
 
@@ -118,6 +128,7 @@ export function MembersDashboard({
   partyCount,
   assignedMemberIds,
   settings,
+  attendanceSessions,
   persistenceEnabled,
 }: {
   guild: Guild;
@@ -125,6 +136,7 @@ export function MembersDashboard({
   partyCount: number;
   assignedMemberIds: string[];
   settings: Settings;
+  attendanceSessions: AttendanceSession[];
   persistenceEnabled: boolean;
 }) {
   const [members, setMembers] = useState<ManagedMember[]>(initial);
@@ -278,6 +290,12 @@ export function MembersDashboard({
     }
   }
 
+  // Latest session's trend point (guild-scoped, chronological → last).
+  const latestTrend = useMemo(() => {
+    const t = guildTrend(attendanceSessions, guild);
+    return t.length > 0 ? t[t.length - 1] : null;
+  }, [attendanceSessions, guild]);
+
   const classMax = Math.max(1, ...a.perClass.map((r) => r.count));
   const classAvgMax = Math.max(1, ...a.perClass.map((r) => r.avg));
   const bucketMax = Math.max(1, ...a.buckets.map((b) => b.count));
@@ -397,14 +415,46 @@ export function MembersDashboard({
               />
             </div>
 
-            {/* Attendance placeholder — no fabricated numbers. */}
-            <div className="rounded-xl border border-dashed border-indigo-400/20 bg-indigo-950/10 p-4">
-              <div className="text-[11px] font-semibold tracking-wide text-slate-500 uppercase">
-                Attendance — coming soon
+            {/* GvG attendance snapshot — full overview lives on /attendance. */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-indigo-400/30 bg-indigo-950/10 p-4">
+              <div className="text-[11px] font-semibold tracking-wide text-slate-400 uppercase">
+                GvG Attendance
               </div>
-              <div className="mt-1 text-xs text-slate-600">
-                Voice-chat attendance tracking will appear here in a later phase.
+              <div className="text-xs text-slate-300">
+                {attendanceSessions.length === 0 ? (
+                  <span className="text-slate-500">
+                    No completed sessions yet.
+                  </span>
+                ) : (
+                  <>
+                    {attendanceSessions.length} session
+                    {attendanceSessions.length === 1 ? "" : "s"} tracked ·
+                    latest: {latestTrend ? (
+                      <>
+                        <span className="font-semibold text-slate-100">
+                          {latestTrend.present}
+                        </span>{" "}
+                        present
+                        {latestTrend.expected !== null &&
+                          ` of ${latestTrend.expected} expected`}{" "}
+                        ({fmtDateShort(latestTrend.date)})
+                      </>
+                    ) : (
+                      "—"
+                    )}
+                    <span className="text-slate-500">
+                      {" "}
+                      · click a member for their history
+                    </span>
+                  </>
+                )}
               </div>
+              <Link
+                href={`/attendance?guild=${guild}`}
+                className="ml-auto rounded-md border border-indigo-400/30 bg-indigo-950/50 px-3 py-1 text-xs font-medium text-indigo-100 hover:bg-indigo-900/60"
+              >
+                Open attendance →
+              </Link>
             </div>
 
             {/* Per-class table */}
@@ -627,6 +677,8 @@ export function MembersDashboard({
       {selected && (
         <MemberModal
           member={selected}
+          guild={guild}
+          attendanceSessions={attendanceSessions}
           onClose={() => setSelectedId(null)}
           onSave={handleSavePower}
           persistenceEnabled={persistenceEnabled}
@@ -636,18 +688,43 @@ export function MembersDashboard({
   );
 }
 
+// Badge tone per attendance-history status (labels come from STATUS_LABEL so
+// the badge, strip legend, and tooltips always agree).
+function statusBadgeClass(row: MemberSessionRow): string {
+  if (row.status === "present") {
+    return row.flagged
+      ? "bg-amber-500/15 text-amber-300 ring-amber-400/40"
+      : "bg-emerald-500/15 text-emerald-300 ring-emerald-400/40";
+  }
+  if (row.status === "absent") return "bg-red-500/15 text-red-300 ring-red-400/40";
+  if (row.status === "present-uncounted")
+    return "bg-emerald-500/10 text-emerald-200/70 ring-emerald-400/25";
+  return "bg-slate-500/10 text-slate-400 ring-slate-400/25"; // no-data
+}
+
 function MemberModal({
   member,
+  guild,
+  attendanceSessions,
   onClose,
   onSave,
   persistenceEnabled,
 }: {
   member: ManagedMember;
+  guild: Guild;
+  attendanceSessions: AttendanceSession[];
   onClose: () => void;
   onSave: (userId: string, power: number) => void;
   persistenceEnabled: boolean;
 }) {
   const [draft, setDraft] = useState(String(member.power));
+
+  // Session-by-session record + since-joined rate for THIS member in the
+  // page's guild. Pure derivation over the (already guild-scoped) sessions.
+  const attendance = useMemo(
+    () => memberAttendance(attendanceSessions, guild, member.userId),
+    [attendanceSessions, guild, member.userId],
+  );
 
   function save() {
     onSave(member.userId, normalizePower(draft));
@@ -671,7 +748,7 @@ function MemberModal({
       onClick={onClose}
     >
       <div
-        className="neon-edge w-full max-w-md rounded-2xl border border-indigo-400/40 bg-gradient-to-b from-[#161634] to-[#10101f] p-5"
+        className="neon-edge max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-indigo-400/40 bg-gradient-to-b from-[#161634] to-[#10101f] p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center gap-3">
@@ -712,6 +789,67 @@ function MemberModal({
             </div>
           ))}
         </dl>
+
+        {/* GvG attendance: since-joined rate + per-session record. Sessions
+            without a roster snapshot are excluded from the rate (never counted
+            as absent); sessions before the member joined the roster are
+            skipped, so the denominator is naturally "since joined". */}
+        <div className="mt-4 rounded-lg border border-indigo-400/20 bg-indigo-950/20 p-3">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-[11px] font-semibold tracking-wide text-slate-400 uppercase">
+              GvG Attendance
+            </span>
+            <span
+              className="text-sm font-bold text-slate-100"
+              title="Sessions present / sessions on the roster snapshot (since joined)"
+            >
+              {attendance.expectedCount > 0 ? (
+                formatRate(attendance)
+              ) : (
+                <span className="font-normal text-slate-500">
+                  no roster data yet
+                </span>
+              )}
+            </span>
+          </div>
+
+          {attendance.rows.length === 0 ? (
+            <p className="mt-2 text-xs text-slate-500">
+              No tracked GvG sessions for this member yet.
+            </p>
+          ) : (
+            <>
+              <div className="mt-2.5">
+                <MemberSessionStrip rows={attendance.rows} />
+              </div>
+              <ul className="mt-3 max-h-40 space-y-1 overflow-y-auto pr-1 text-xs">
+                {[...attendance.rows].reverse().map((r) => (
+                  <li key={r.sessionId} className="flex items-center gap-2">
+                    <span className="w-12 shrink-0 tabular-nums text-slate-400">
+                      {fmtDateShort(r.date)}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-slate-500">
+                      {r.vcLabel ?? r.sessionLabel}
+                    </span>
+                    {r.flagged && (
+                      <span
+                        className="shrink-0 text-amber-300"
+                        title="Seen in a VC whose roster they're not on (wrong VC / off-roster)"
+                      >
+                        ⚠
+                      </span>
+                    )}
+                    <span
+                      className={`shrink-0 rounded px-1.5 py-px text-[10px] font-semibold ring-1 ${statusBadgeClass(r)}`}
+                    >
+                      {STATUS_LABEL[r.status]}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
 
         <div className="mt-4">
           <label className="text-[11px] font-semibold tracking-wide text-slate-400 uppercase">
