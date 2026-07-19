@@ -1,10 +1,8 @@
 import { getAttendanceSessions } from "@/lib/attendance-data";
 import { isMongoConfigured } from "@/lib/mongo";
 import { TopNav } from "@/components/TopNav";
-import {
-  AttendanceTrendChart,
-  RateLeaderboard,
-} from "@/components/AttendanceCharts";
+import { AttendanceTrendChart } from "@/components/AttendanceCharts";
+import { LeaderboardPanel } from "@/components/LeaderboardPanel";
 import {
   expectedFor,
   fmtDateTime,
@@ -223,9 +221,7 @@ export default async function AttendancePage({
                 snapshot. Sessions without roster data don’t count.
               </p>
               {leaderboard.length > 0 ? (
-                <div className="max-h-[420px] overflow-y-auto pr-1">
-                  <RateLeaderboard rows={leaderboard} />
-                </div>
+                <LeaderboardPanel rows={leaderboard} />
               ) : (
                 <p className="text-xs text-slate-500">
                   No roster snapshots yet — the leaderboard fills in once the

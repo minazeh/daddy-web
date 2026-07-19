@@ -17,6 +17,7 @@ import {
   guildTrend,
   memberAttendance,
   type AttendanceSession,
+  type MemberAttendance,
   type MemberSessionRow,
 } from "@/lib/attendance";
 import { MemberSessionStrip, STATUS_LABEL } from "./AttendanceCharts";
@@ -41,7 +42,77 @@ const ROLE_LABEL: Record<Role, string> = {
   dps: "DPS",
 };
 
-type SortMode = "name-asc" | "name-desc" | "power-desc" | "power-asc";
+// Clickable per-class table header: a real <button> inside the <th> (keeps
+// the table semantics + keyboard/focus behavior), with aria-sort reflecting
+// the active column and a ▲/▼ indicator matching the current direction.
+function ClassTh({
+  col,
+  label,
+  align,
+  active,
+  dir,
+  onSort,
+}: {
+  col: string;
+  label: string;
+  align: "left" | "right";
+  active: boolean;
+  dir: "asc" | "desc" | null;
+  onSort: () => void;
+}) {
+  return (
+    <th
+      className={[
+        "py-1 font-semibold",
+        align === "right" ? "text-right" : "text-left",
+        col === "unrated" ? "" : "pr-3",
+      ].join(" ")}
+      aria-sort={active ? (dir === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        onClick={onSort}
+        className={[
+          "inline-flex items-center gap-1 hover:text-slate-100",
+          align === "right" ? "w-full justify-end" : "",
+          active ? "text-slate-100" : "text-slate-400",
+        ].join(" ")}
+      >
+        {label}
+        {active && <span aria-hidden>{dir === "asc" ? "▲" : "▼"}</span>}
+      </button>
+    </th>
+  );
+}
+
+type SortMode =
+  | "name-asc"
+  | "name-desc"
+  | "power-desc"
+  | "power-asc"
+  | "class-asc"
+  | "class-desc"
+  | "attendance-desc"
+  | "attendance-asc";
+
+// Per-class table: sortable columns. `null` classSort = the fixed default
+// order (8 known classes + "Unknown/none" last), rendered identically on the
+// server and first client render. Only user clicks introduce client-only sort
+// state.
+type ClassSortColumn =
+  | "cls"
+  | "role"
+  | "count"
+  | "avg"
+  | "min"
+  | "max"
+  | "median"
+  | "unrated";
+type ClassSortDir = "asc" | "desc";
+interface ClassSort {
+  col: ClassSortColumn;
+  dir: ClassSortDir;
+}
 
 function median(nums: number[]): number {
   if (nums.length === 0) return 0;
@@ -144,7 +215,22 @@ export function MembersDashboard({
   const [query, setQuery] = useState("");
   // Default sort is deterministic (Name A→Z) so SSR === first client render.
   const [sortMode, setSortMode] = useState<SortMode>("name-asc");
+  // Per-class table sort. `null` = default fixed order (server-rendered);
+  // set only by a header click (client-only).
+  const [classSort, setClassSort] = useState<ClassSort | null>(null);
   const [, startTransition] = useTransition();
+
+  function handleClassSort(col: ClassSortColumn) {
+    setClassSort((prev) => {
+      if (prev && prev.col === col) {
+        return { col, dir: prev.dir === "asc" ? "desc" : "asc" };
+      }
+      // First click on a column: text columns default A→Z, numeric columns
+      // default high→low (most useful reading order for each).
+      const dir: ClassSortDir = col === "cls" || col === "role" ? "asc" : "desc";
+      return { col, dir };
+    });
+  }
 
   const assignedSet = useMemo(
     () => new Set(assignedMemberIds),
@@ -155,6 +241,16 @@ export function MembersDashboard({
     () => members.find((m) => m.userId === selectedId) ?? null,
     [members, selectedId],
   );
+
+  // Since-joined attendance rate per member, precomputed once so the sort
+  // comparator below doesn't recompute it per pairwise comparison.
+  const attendanceByMember = useMemo(() => {
+    const map = new Map<string, MemberAttendance>();
+    for (const m of members) {
+      map.set(m.userId, memberAttendance(attendanceSessions, guild, m.userId));
+    }
+    return map;
+  }, [members, attendanceSessions, guild]);
 
   // ---- left list: filter + deterministic sort ----
   const visible = useMemo(() => {
@@ -182,10 +278,50 @@ export function MembersDashboard({
             : byNameThenId(a, b); // power ties broken by name
         case "power-asc":
           return a.power !== b.power ? a.power - b.power : byNameThenId(a, b);
+        case "class-asc": {
+          const noA = !a.className;
+          const noB = !b.className;
+          if (noA && noB) return byNameThenId(a, b); // no class sorts last either way
+          if (noA) return 1;
+          if (noB) return -1;
+          const c = a.className!.localeCompare(b.className!);
+          return c !== 0 ? c : byNameThenId(a, b);
+        }
+        case "class-desc": {
+          const noA = !a.className;
+          const noB = !b.className;
+          if (noA && noB) return byNameThenId(a, b);
+          if (noA) return 1;
+          if (noB) return -1;
+          const c = b.className!.localeCompare(a.className!);
+          return c !== 0 ? c : byNameThenId(a, b);
+        }
+        case "attendance-desc": {
+          const ra = attendanceByMember.get(a.userId)!;
+          const rb = attendanceByMember.get(b.userId)!;
+          if (ra.expectedCount === 0 && rb.expectedCount === 0)
+            return byNameThenId(a, b); // no roster data sorts last either way
+          if (ra.expectedCount === 0) return 1;
+          if (rb.expectedCount === 0) return -1;
+          return rb.ratePct! !== ra.ratePct!
+            ? rb.ratePct! - ra.ratePct!
+            : byNameThenId(a, b);
+        }
+        case "attendance-asc": {
+          const ra = attendanceByMember.get(a.userId)!;
+          const rb = attendanceByMember.get(b.userId)!;
+          if (ra.expectedCount === 0 && rb.expectedCount === 0)
+            return byNameThenId(a, b);
+          if (ra.expectedCount === 0) return 1;
+          if (rb.expectedCount === 0) return -1;
+          return ra.ratePct! !== rb.ratePct!
+            ? ra.ratePct! - rb.ratePct!
+            : byNameThenId(a, b);
+        }
       }
     });
     return filtered;
-  }, [members, query, sortMode]);
+  }, [members, query, sortMode, attendanceByMember]);
 
   // ---- analytics (active members for stats unless noted) ----
   const a = useMemo(() => {
@@ -296,6 +432,47 @@ export function MembersDashboard({
     return t.length > 0 ? t[t.length - 1] : null;
   }, [attendanceSessions, guild]);
 
+  // Per-class table display order: `classSort === null` renders the fixed
+  // default order (a.perClass, server-computed); a header click introduces
+  // client-only re-sorting. Ties always break by class name.
+  const perClassSorted = useMemo(() => {
+    if (!classSort) return a.perClass;
+    const { col, dir } = classSort;
+    const rows = [...a.perClass];
+    rows.sort((x, y) => {
+      let cmp: number;
+      switch (col) {
+        case "cls":
+          cmp = x.cls.localeCompare(y.cls);
+          break;
+        case "role":
+          cmp = ROLE_LABEL[x.role].localeCompare(ROLE_LABEL[y.role]);
+          break;
+        case "count":
+          cmp = x.count - y.count;
+          break;
+        case "avg":
+          cmp = x.avg - y.avg;
+          break;
+        case "min":
+          cmp = x.min - y.min;
+          break;
+        case "max":
+          cmp = x.max - y.max;
+          break;
+        case "median":
+          cmp = x.median - y.median;
+          break;
+        case "unrated":
+          cmp = x.unrated - y.unrated;
+          break;
+      }
+      if (cmp === 0) cmp = x.cls.localeCompare(y.cls);
+      return dir === "asc" ? cmp : -cmp;
+    });
+    return rows;
+  }, [a.perClass, classSort]);
+
   const classMax = Math.max(1, ...a.perClass.map((r) => r.count));
   const classAvgMax = Math.max(1, ...a.perClass.map((r) => r.avg));
   const bucketMax = Math.max(1, ...a.buckets.map((b) => b.count));
@@ -335,6 +512,10 @@ export function MembersDashboard({
                 <option value="name-desc">Name: Z → A</option>
                 <option value="power-desc">Power: high → low</option>
                 <option value="power-asc">Power: low → high</option>
+                <option value="class-asc">Class: A → Z</option>
+                <option value="class-desc">Class: Z → A</option>
+                <option value="attendance-desc">Attendance: high → low</option>
+                <option value="attendance-asc">Attendance: low → high</option>
               </select>
             </div>
             <div className="text-[10px] text-slate-500">
@@ -466,18 +647,32 @@ export function MembersDashboard({
                 <table className="w-full text-xs">
                   <thead>
                     <tr className="text-left text-slate-400">
-                      <th className="py-1 pr-3 font-semibold">Class</th>
-                      <th className="py-1 pr-3 font-semibold">Role</th>
-                      <th className="py-1 pr-3 text-right font-semibold">Count</th>
-                      <th className="py-1 pr-3 text-right font-semibold">Avg</th>
-                      <th className="py-1 pr-3 text-right font-semibold">Min</th>
-                      <th className="py-1 pr-3 text-right font-semibold">Max</th>
-                      <th className="py-1 pr-3 text-right font-semibold">Median</th>
-                      <th className="py-1 text-right font-semibold">Unrated</th>
+                      {(
+                        [
+                          ["cls", "Class", "left"],
+                          ["role", "Role", "left"],
+                          ["count", "Count", "right"],
+                          ["avg", "Avg", "right"],
+                          ["min", "Min", "right"],
+                          ["max", "Max", "right"],
+                          ["median", "Median", "right"],
+                          ["unrated", "Unrated", "right"],
+                        ] as [ClassSortColumn, string, "left" | "right"][]
+                      ).map(([col, label, align]) => (
+                        <ClassTh
+                          key={col}
+                          col={col}
+                          label={label}
+                          align={align}
+                          active={classSort?.col === col}
+                          dir={classSort?.col === col ? classSort.dir : null}
+                          onSort={() => handleClassSort(col)}
+                        />
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {a.perClass.map((r) => (
+                    {perClassSorted.map((r) => (
                       <tr
                         key={r.cls}
                         className="border-t border-indigo-500/10 text-slate-200"
