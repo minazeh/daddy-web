@@ -59,12 +59,17 @@ export function BuilderShell({
   members,
   parties: initialParties,
   settings,
+  unavailableIds,
   persistenceEnabled,
 }: {
   guild: Guild;
   members: Member[];
   parties: Party[];
   settings: Settings;
+  // userIds who said "can't make it" to the soonest upcoming Guild Event for
+  // this guild — greyed + deprioritized (never blocked). Empty when there is no
+  // upcoming event or Mongo is unavailable. (Bot-owned intent; read in page.tsx.)
+  unavailableIds: Set<string>;
   persistenceEnabled: boolean;
 }) {
   const [parties, setParties] = useState<Party[]>(initialParties);
@@ -375,7 +380,12 @@ export function BuilderShell({
       <div className="flex h-screen w-full flex-col overflow-hidden">
         <TopNav guild={guild} active="party" />
         <div className="flex min-h-0 flex-1 overflow-hidden">
-          <MemberPool guild={guild} members={members} assignedIds={assignedIds} />
+          <MemberPool
+            guild={guild}
+            members={members}
+            assignedIds={assignedIds}
+            unavailableIds={unavailableIds}
+          />
 
         {/* RIGHT: vertically-scrollable board (no zoom/pan). */}
         <div className="relative flex-1 overflow-y-auto overflow-x-hidden canvas-grid">
@@ -470,6 +480,7 @@ export function BuilderShell({
                       onRemoveMember={removeFromParty}
                       persistenceEnabled={persistenceEnabled}
                       missing={missingByParty.get(p.partyId) ?? []}
+                      unavailableIds={unavailableIds}
                     />
                   ))}
                 </div>
@@ -488,6 +499,7 @@ export function BuilderShell({
             instanceId="overlay"
             from="overlay"
             overlay
+            unavailable={unavailableIds.has(activeMember.userId)}
           />
         ) : null}
       </DragOverlay>

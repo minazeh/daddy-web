@@ -1,4 +1,10 @@
-import { getMembers, getParties, getPowerMap, getSettings } from "@/lib/data";
+import {
+  getMembers,
+  getParties,
+  getPowerMap,
+  getSettings,
+  getUnavailableIds,
+} from "@/lib/data";
 import { isMongoConfigured } from "@/lib/mongo";
 import { BuilderShell } from "@/components/BuilderShell";
 import { DEFAULT_GUILD, isGuild, type Guild } from "@/lib/types";
@@ -25,12 +31,16 @@ export default async function DashboardPage({
   // Scoped to the selected guild only — never both. Power lives in the
   // web-owned memberMeta (not the bot's `members`), so we join it in here:
   // enrich each member with their power (default 0 when unrated) for the chips.
-  const [rawMembers, parties, powerMap, settings] = await Promise.all([
-    getMembers(guild),
-    getParties(guild),
-    getPowerMap(guild),
-    getSettings(),
-  ]);
+  const [rawMembers, parties, powerMap, settings, unavailableIds] =
+    await Promise.all([
+      getMembers(guild),
+      getParties(guild),
+      getPowerMap(guild),
+      getSettings(),
+      // "Can't make it" RSVPs for the soonest upcoming Guild Event of this guild
+      // (bot-owned intent). Greys + deprioritizes those members in the builder.
+      getUnavailableIds(guild),
+    ]);
   const members = rawMembers.map((m) => ({
     ...m,
     power: powerMap.get(m.userId) ?? 0,
@@ -45,6 +55,7 @@ export default async function DashboardPage({
       members={members}
       parties={parties}
       settings={settings}
+      unavailableIds={unavailableIds}
       persistenceEnabled={isMongoConfigured}
     />
   );

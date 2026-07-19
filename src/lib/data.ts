@@ -1,5 +1,6 @@
 import "server-only";
 import { revalidatePath } from "next/cache";
+import { ObjectId } from "mongodb";
 import type { AnyBulkWriteOperation, Collection } from "mongodb";
 import { getDb, isMongoConfigured } from "./mongo";
 import {
@@ -643,4 +644,138 @@ export async function getRaidGroups(guild: Guild): Promise<RaidGroup[]> {
     .sort({ position: 1, raidGroupId: 1 })
     .toArray();
   return docs.map(serializeRaidGroup).sort(compareRaidGroups);
+}
+
+// ---- Guild Event "can't make it" intent (bot-owned; read-only here) ----
+//
+// The Discord bot writes `gvg_attendance_intent` (spec §3): one doc per member
+// per event occurrence, with the member's yes/no RSVP. This app READS it to grey
+// out + deprioritize the members who said "no" to the SOONEST upcoming event for
+// the shown guild, in the party builder.
+
+const INTENT = "gvg_attendance_intent";
+const GVG_SCHEDULES = "gvg_schedules";
+
+type ScheduleGuild = "daddy" | "mummy" | "both";
+
+// One `gvg_attendance_intent` doc as written by the bot (loose — this app never
+// writes it). `scheduleId` is stored as the STRING of the source
+// `gvg_schedules._id` ObjectId; `guild` is the responder's COLLAPSED affiliation
+// (a "both"-member is stored once as "daddy") and is deliberately NOT used here.
+interface IntentDoc {
+  occurrenceKey: string;
+  scheduleId: string;
+  userId: string;
+  response: "yes" | "no";
+  eventAt: Date | string;
+}
+
+// A `gvg_schedules` doc (bot-owned). Only `_id` + `guild` are needed to resolve
+// an occurrence's TRUE guild scope.
+interface GvgScheduleDoc {
+  _id: ObjectId;
+  guild?: ScheduleGuild;
+}
+
+function normalizeScheduleGuild(v: unknown): ScheduleGuild {
+  return v === "daddy" || v === "mummy" || v === "both" ? v : "both";
+}
+
+// Resolve the set of userIds who responded "no" to the SOONEST upcoming Guild
+// Event occurrence relevant to `guild`, per spec §8 (the "both"-member fix):
+//   a. Read intent docs with response:"no" and eventAt >= now.
+//   b. Group by occurrenceKey; resolve each occurrence's TRUE guild from its
+//      SCHEDULE (scheduleId -> gvg_schedules.guild), NOT the intent's collapsed
+//      `guild` field — so a "both"-member (stored once as "daddy") is not missed
+//      by a naive guild filter.
+//   c. Keep occurrences whose schedule guild is in { guild, 'both' }; pick the
+//      soonest eventAt (ties broken by occurrenceKey for determinism).
+//   d. Return the Set of userIds with response:"no" for that occurrence.
+// Graceful-degrade to an EMPTY set when Mongo is unconfigured or on ANY error —
+// never throws into the page render.
+export async function getUnavailableIds(guild: Guild): Promise<Set<string>> {
+  const empty = new Set<string>();
+  if (!isMongoConfigured) return empty;
+
+  try {
+    const db = await getDb();
+    const now = new Date();
+
+    // (a) "no" RSVPs for events that haven't started yet.
+    const docs = await db
+      .collection<IntentDoc>(INTENT)
+      .find({ response: "no", eventAt: { $gte: now } })
+      .toArray();
+    if (docs.length === 0) return empty;
+
+    // (b) Resolve each distinct scheduleId to its schedule's guild. intent
+    // stores scheduleId as the ObjectId hex string; gvg_schedules._id is an
+    // ObjectId, so cast for the $in lookup (skip any malformed id).
+    const scheduleOids: ObjectId[] = [];
+    const seenScheduleIds = new Set<string>();
+    for (const d of docs) {
+      const sid = d.scheduleId ? String(d.scheduleId) : "";
+      if (!sid || seenScheduleIds.has(sid)) continue;
+      seenScheduleIds.add(sid);
+      try {
+        scheduleOids.push(new ObjectId(sid));
+      } catch {
+        // malformed scheduleId — its occurrences can't be resolved; skipped.
+      }
+    }
+    if (scheduleOids.length === 0) return empty;
+
+    const schedules = await db
+      .collection<GvgScheduleDoc>(GVG_SCHEDULES)
+      .find({ _id: { $in: scheduleOids } })
+      .toArray();
+    const guildBySchedule = new Map<string, ScheduleGuild>();
+    for (const s of schedules) {
+      guildBySchedule.set(String(s._id), normalizeScheduleGuild(s.guild));
+    }
+
+    // (b/c) Group "no" docs by occurrence, keeping only occurrences whose
+    // SCHEDULE guild covers the shown guild (its own guild or "both").
+    interface Occurrence {
+      eventAt: number;
+      userIds: Set<string>;
+    }
+    const byOccurrence = new Map<string, Occurrence>();
+    for (const d of docs) {
+      const sGuild = guildBySchedule.get(String(d.scheduleId));
+      if (!sGuild) continue; // schedule missing/deleted — can't resolve; skip.
+      if (sGuild !== guild && sGuild !== "both") continue; // other guild only.
+      const t = new Date(d.eventAt).getTime();
+      if (!Number.isFinite(t)) continue;
+      let occ = byOccurrence.get(d.occurrenceKey);
+      if (!occ) {
+        occ = { eventAt: t, userIds: new Set<string>() };
+        byOccurrence.set(d.occurrenceKey, occ);
+      }
+      occ.userIds.add(d.userId);
+      if (t < occ.eventAt) occ.eventAt = t; // defensive: min across the group.
+    }
+    if (byOccurrence.size === 0) return empty;
+
+    // (c) Pick the SOONEST occurrence (deterministic tie-break on occurrenceKey).
+    let bestKey = "";
+    let best: Occurrence | null = null;
+    for (const [key, occ] of byOccurrence) {
+      if (
+        !best ||
+        occ.eventAt < best.eventAt ||
+        (occ.eventAt === best.eventAt && key < bestKey)
+      ) {
+        best = occ;
+        bestKey = key;
+      }
+    }
+
+    // (d) The "no" userIds for that occurrence.
+    return best ? best.userIds : empty;
+  } catch {
+    // Any failure (DB down, bad data) degrades to "nobody greyed" — the builder
+    // must never throw over an optional overlay of RSVP state.
+    return empty;
+  }
 }

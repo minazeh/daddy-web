@@ -16,6 +16,7 @@ function Slot({
   index,
   member,
   locked,
+  unavailable,
   onToggleLock,
   onRemove,
 }: {
@@ -23,6 +24,9 @@ function Slot({
   index: number;
   member: Member | null;
   locked: boolean;
+  // This slot's member said "can't make it" → greyed (position unchanged, even
+  // when locked). Purely visual.
+  unavailable: boolean;
   onToggleLock: (index: number) => void;
   onRemove: (memberId: string) => void;
 }) {
@@ -80,6 +84,7 @@ function Slot({
           from={partyId}
           compact
           locked={locked}
+          unavailable={unavailable}
         />
       ) : (
         <div className="flex items-center justify-center px-2 py-2 text-[11px] text-indigo-300/40">
@@ -99,6 +104,7 @@ export function PartyCard({
   onRemoveMember,
   persistenceEnabled,
   missing = [],
+  unavailableIds,
 }: {
   party: Party;
   membersById: Map<string, Member>;
@@ -109,6 +115,9 @@ export function PartyCard({
   persistenceEnabled: boolean;
   // Required classNames this party is currently MISSING (empty = meets all).
   missing?: string[];
+  // "Can't make it" userIds — greys the matching in-party members (visual only;
+  // never reorders or unassigns them).
+  unavailableIds: Set<string>;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(party.name);
@@ -190,6 +199,7 @@ export function PartyCard({
             index={i}
             member={m}
             locked={lockedSet.has(i)}
+            unavailable={m ? unavailableIds.has(m.userId) : false}
             onToggleLock={(idx) => onToggleLock(party.partyId, idx)}
             onRemove={(memberId) => onRemoveMember(party.partyId, memberId)}
           />

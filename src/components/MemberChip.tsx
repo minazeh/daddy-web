@@ -21,6 +21,7 @@ export function MemberChip({
   overlay = false,
   compact = false,
   locked = false,
+  unavailable = false,
 }: {
   member: Member;
   instanceId: string;
@@ -30,6 +31,10 @@ export function MemberChip({
   // A locked member is FIXED: not draggable (can't be dragged out, can't be a
   // swap source). dnd-kit's `disabled` removes the listeners entirely.
   locked?: boolean;
+  // Member said "can't make it" to the soonest upcoming Guild Event → dimmed +
+  // desaturated with a subtle 😔. Purely visual: still draggable (unless locked),
+  // never reordered within a party. Applies in the pool AND in party slots.
+  unavailable?: boolean;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: instanceId,
@@ -42,12 +47,16 @@ export function MemberChip({
       ref={setNodeRef}
       {...(locked ? {} : listeners)}
       {...(locked ? {} : attributes)}
+      title={unavailable ? "Can't make it to the next Guild Event" : undefined}
       className={[
         "flex touch-none items-center gap-2 rounded-lg border px-2.5 py-1.5 text-sm select-none",
         locked ? "cursor-default" : "cursor-grab active:cursor-grabbing",
         "border-indigo-400/30 bg-indigo-950/60 text-slate-100 backdrop-blur-sm",
         compact ? "" : "shadow-sm",
         isDragging && !overlay ? "opacity-30" : "",
+        // "Can't make it": desaturate + dim + a muted ring. Layered under the
+        // drag-opacity above so a dragged unavailable chip still fades correctly.
+        unavailable ? "opacity-50 grayscale" : "",
         overlay ? "neon-edge-strong scale-105" : "hover:border-indigo-300/60",
       ].join(" ")}
     >
@@ -77,6 +86,16 @@ export function MemberChip({
           <span className="text-[10px] tabular-nums text-slate-300">
             ⚡{member.power ?? 0}
           </span>
+          {/* Subtle "can't make it" marker — matches the bot's 😔 button. */}
+          {unavailable && (
+            <span
+              className="text-[10px] leading-none"
+              aria-label="Can't make it"
+              title="Can't make it to the next Guild Event"
+            >
+              😔
+            </span>
+          )}
         </span>
       </span>
     </div>
