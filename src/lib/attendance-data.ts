@@ -22,6 +22,11 @@ import type { Guild } from "./types";
 
 const ATTENDANCE = "gvg_attendance";
 
+// Attendance before this instant is hidden from the dashboard (bot records are
+// untouched — this is a reversible read filter). July 7, 2026 00:00 GMT+7 (the
+// bot's GvG timezone) = 2026-07-06T17:00:00Z. Change/remove this to adjust/undo.
+export const ATTENDANCE_CUTOFF_ISO = "2026-07-06T17:00:00.000Z";
+
 // Loose doc shape as written by the bot (dates are Mongo Dates; _id ObjectId).
 interface AttendanceDoc {
   _id: { toString(): string };
@@ -138,7 +143,11 @@ function serializeSession(d: AttendanceDoc): AttendanceSession {
 export async function getAttendanceSessions(
   guild: Guild,
 ): Promise<AttendanceSession[]> {
-  if (!isMongoConfigured) return sessionsForGuild(MOCK_ATTENDANCE, guild);
+  if (!isMongoConfigured) {
+    return sessionsForGuild(MOCK_ATTENDANCE, guild).filter(
+      (s) => s.startedAt >= ATTENDANCE_CUTOFF_ISO,
+    );
+  }
   const db = await getDb();
   const docs = await db
     .collection<AttendanceDoc>(ATTENDANCE)
@@ -149,5 +158,10 @@ export async function getAttendanceSessions(
     .sort({ startedAt: 1, _id: 1 })
     .toArray();
   // Re-scope + re-sort through the shared helper so Mongo and mock paths agree.
-  return sessionsForGuild(docs.map(serializeSession), guild);
+  // The cutoff filter runs on the serialized ISO string (source of truth — the
+  // Mongo field may be stored as a Date or a string, so a query-level type
+  // comparison would be unreliable) and is applied identically to both paths.
+  return sessionsForGuild(docs.map(serializeSession), guild).filter(
+    (s) => s.startedAt >= ATTENDANCE_CUTOFF_ISO,
+  );
 }
