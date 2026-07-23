@@ -3,12 +3,13 @@
 import { useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import type { Member, Party, RaidGroup } from "@/lib/types";
-import { partyHasPriest } from "@/lib/types";
+import { partyHasPriest, raidGroupMemberIds } from "@/lib/types";
 import { PartyChip } from "./PartyChip";
 
 // A raid group: a droppable container you drag PARTY chips into. Editable name +
 // delete button (delete frees its parties back to the pool — handled in
-// RaidShell). No cap on parties per group.
+// RaidShell) + a LEADER select (one member of the raid's parties). No cap on
+// parties per group.
 
 export function RaidGroupCard({
   raid,
@@ -16,6 +17,7 @@ export function RaidGroupCard({
   membersById,
   onRename,
   onDelete,
+  onSetLeader,
   persistenceEnabled,
 }: {
   raid: RaidGroup;
@@ -23,6 +25,7 @@ export function RaidGroupCard({
   membersById: Map<string, Member>;
   onRename: (raidGroupId: string, name: string) => void;
   onDelete: (raidGroupId: string) => void;
+  onSetLeader: (raidGroupId: string, userId: string | null) => void;
   persistenceEnabled: boolean;
 }) {
   const [editing, setEditing] = useState(false);
@@ -37,6 +40,20 @@ export function RaidGroupCard({
   const parties = raid.partyIds
     .map((id) => partiesById.get(id))
     .filter((p): p is Party => p !== undefined);
+
+  // Eligible leaders = the deduped union of this raid's parties' members,
+  // resolved to Member objects (skip any id not in the roster, defensively).
+  const eligibleIds = raidGroupMemberIds(raid, partiesById);
+  const eligible = eligibleIds
+    .map((id) => membersById.get(id))
+    .filter((m): m is Member => m !== undefined);
+
+  // Current leader — but DEFENSIVELY only if still one of the raid's members
+  // (a member may have been moved/removed). Otherwise render as unset; never
+  // crash or show a stale name.
+  const leaderIsValid =
+    typeof raid.leaderId === "string" && eligibleIds.includes(raid.leaderId);
+  const currentLeaderId = leaderIsValid ? (raid.leaderId as string) : "";
 
   function commitRename() {
     setEditing(false);
@@ -96,6 +113,38 @@ export function RaidGroupCard({
             🗑
           </button>
         </div>
+      </div>
+
+      {/* Leader select: one member of THIS raid's parties (deduped union). */}
+      <div className="mb-2 flex items-center gap-2">
+        <span
+          className="shrink-0 text-[11px] font-semibold tracking-wide text-amber-300/90 uppercase"
+          title="The raid leader — must be a member of one of this raid's parties."
+        >
+          Leader
+        </span>
+        <select
+          value={currentLeaderId}
+          onChange={(e) =>
+            onSetLeader(raid.raidGroupId, e.target.value || null)
+          }
+          disabled={!persistenceEnabled || eligible.length === 0}
+          title={
+            !persistenceEnabled
+              ? "Needs MONGODB_URI"
+              : eligible.length === 0
+                ? "Add parties with members first"
+                : "Choose a raid leader"
+          }
+          className="min-w-0 flex-1 truncate rounded border border-amber-400/30 bg-[#0c0c1c] px-1.5 py-1 text-xs text-slate-100 disabled:opacity-40"
+        >
+          <option value="">No leader</option>
+          {eligible.map((m) => (
+            <option key={m.userId} value={m.userId}>
+              {m.displayName}
+            </option>
+          ))}
+        </select>
       </div>
 
       <div className="flex min-h-[48px] flex-col gap-1.5 rounded-lg border border-dashed border-indigo-400/20 p-1.5">

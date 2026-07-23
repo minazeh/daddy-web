@@ -29,6 +29,7 @@ import {
   deleteRaidGroup,
   removePartyFromRaid,
   renameRaidGroup,
+  setRaidLeader,
 } from "@/lib/actions";
 import { PartyChip, type PartyDragData } from "./PartyChip";
 import { RaidGroupCard } from "./RaidGroupCard";
@@ -205,6 +206,21 @@ export function RaidShell({
     }
   }
 
+  // Set/clear a raid group's leader (optimistic local update + persist), wired
+  // exactly like handleRename. `userId === null` clears the leader.
+  function handleSetLeader(raidGroupId: string, userId: string | null) {
+    setRaids((prev) =>
+      prev.map((r) =>
+        r.raidGroupId === raidGroupId ? { ...r, leaderId: userId } : r,
+      ),
+    );
+    if (persistenceEnabled) {
+      startTransition(async () => {
+        refresh(await setRaidLeader(guild, raidGroupId, userId));
+      });
+    }
+  }
+
   async function handleDelete(raidGroupId: string) {
     if (
       !window.confirm(
@@ -257,6 +273,7 @@ export function RaidShell({
                 onAdd={() => handleAdd(field)}
                 onRename={handleRename}
                 onDelete={handleDelete}
+                onSetLeader={handleSetLeader}
                 persistenceEnabled={persistenceEnabled}
                 busy={busy}
               />
@@ -295,6 +312,7 @@ function FieldSection({
   onAdd,
   onRename,
   onDelete,
+  onSetLeader,
   persistenceEnabled,
   busy,
 }: {
@@ -307,6 +325,7 @@ function FieldSection({
   onAdd: () => void;
   onRename: (raidGroupId: string, name: string) => void;
   onDelete: (raidGroupId: string) => void;
+  onSetLeader: (raidGroupId: string, userId: string | null) => void;
   persistenceEnabled: boolean;
   busy: boolean;
 }) {
@@ -391,6 +410,7 @@ function FieldSection({
               membersById={membersById}
               onRename={onRename}
               onDelete={onDelete}
+              onSetLeader={onSetLeader}
               persistenceEnabled={persistenceEnabled}
             />
           ))}

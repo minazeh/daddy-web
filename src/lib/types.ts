@@ -142,7 +142,35 @@ export interface RaidGroup {
   name: string;
   partyIds: string[]; // assigned party ids (no cap)
   position: number; // ordering within (type, field)
+  // The raid leader: a Discord userId that MUST be a member of one of this raid
+  // group's parties (the eligible set = raidGroupMemberIds). null/absent = no
+  // leader. Each raid group has its own single leader. Web app writes it; the
+  // Discord bot reads it (read-only) to crown the leader in /guildroster.
+  leaderId?: string | null;
   updatedAt: string; // ISO string
+}
+
+// The eligible-leader member set for a raid group: the DEDUPED UNION of the
+// memberIds across every party assigned to the raid group, in party order then
+// slot order (deterministic). The raid leader MUST be one of these userIds.
+// Reused by the leader select (UI) and by server-side validation so both agree.
+export function raidGroupMemberIds(
+  raid: Pick<RaidGroup, "partyIds">,
+  partiesById: Map<string, Pick<Party, "memberIds">>,
+): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const partyId of raid.partyIds) {
+    const p = partiesById.get(partyId);
+    if (!p) continue;
+    for (const id of p.memberIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+  }
+  return out;
 }
 
 // ---- Roles (for the roster auto-fill / Generate) ----

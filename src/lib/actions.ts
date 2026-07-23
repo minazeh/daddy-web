@@ -13,6 +13,7 @@ import {
 import { MOCK_MEMBER_META, MOCK_RAID_GROUPS, MOCK_SETTINGS } from "./mock";
 import {
   normalizePower,
+  raidGroupMemberIds,
   roleFor,
   validateSettings,
   type Field,
@@ -526,6 +527,7 @@ export async function createRaidGroup(
       name: `${field === "main" ? "Main" : "Sub"} Raid ${count + 1}`,
       partyIds: [],
       position: count,
+      leaderId: null,
       updatedAt: new Date().toISOString(),
     });
     return mockReturn(guild);
@@ -541,6 +543,7 @@ export async function createRaidGroup(
     name: `${field === "main" ? "Main" : "Sub"} Raid ${count + 1}`,
     partyIds: [],
     position: count,
+    leaderId: null,
     updatedAt: new Date().toISOString(),
   });
   revalidateRaids();
@@ -672,6 +675,55 @@ export async function removePartyFromRaid(
       $pull: { partyIds: partyId },
       $set: { updatedAt: new Date().toISOString() },
     },
+  );
+  revalidateRaids();
+  return { ok: true, raidGroups: await getRaidGroups(guild) };
+}
+
+// SET / CLEAR a raid group's leader. `userId === null` (or "") clears it.
+// Server-side validation (the UI select is not trusted): a non-null leader MUST
+// be a member of one of this raid group's parties (the union — raidGroupMemberIds).
+// Any other id is rejected. Scoped to the guild; auto-saves + returns the fresh
+// list for optimistic UI, exactly like the other raid-group mutations.
+export async function setRaidLeader(
+  guild: Guild,
+  raidGroupId: string,
+  userId: string | null,
+): Promise<RaidResult> {
+  const clearing = userId === null || userId === "";
+
+  if (!clearing) {
+    // Resolve this guild's parties + raid groups (works in both mock + real
+    // mode) to validate the candidate against the raid's eligible member set.
+    const [parties, raidGroups] = await Promise.all([
+      getParties(guild),
+      getRaidGroups(guild),
+    ]);
+    const raid = raidGroups.find((r) => r.raidGroupId === raidGroupId);
+    if (!raid) return { ok: false, message: "Raid group not found." };
+    const partiesById = new Map<string, Party>(
+      parties.map((p) => [p.partyId, p]),
+    );
+    const eligible = new Set(raidGroupMemberIds(raid, partiesById));
+    if (!eligible.has(userId as string)) {
+      return { ok: false, message: "Leader must be a member of this raid." };
+    }
+  }
+
+  const nextLeaderId = clearing ? null : userId;
+
+  if (!isMongoConfigured) {
+    const r = MOCK_RAID_GROUPS.find(
+      (g) => g.raidGroupId === raidGroupId && g.type === guild,
+    );
+    if (r) r.leaderId = nextLeaderId;
+    return mockReturn(guild);
+  }
+
+  const db = await getDb();
+  await db.collection<RaidGroup>(RAID_GROUPS).updateOne(
+    { raidGroupId },
+    { $set: { leaderId: nextLeaderId, updatedAt: new Date().toISOString() } },
   );
   revalidateRaids();
   return { ok: true, raidGroups: await getRaidGroups(guild) };

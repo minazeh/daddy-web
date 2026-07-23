@@ -607,6 +607,7 @@ interface RaidGroupDoc {
   name: string;
   partyIds?: string[];
   position?: number;
+  leaderId?: string | null;
   updatedAt?: Date | string;
 }
 
@@ -618,6 +619,7 @@ function serializeRaidGroup(d: RaidGroupDoc): RaidGroup {
     name: d.name,
     partyIds: Array.isArray(d.partyIds) ? d.partyIds : [],
     position: typeof d.position === "number" ? d.position : 0,
+    leaderId: typeof d.leaderId === "string" ? d.leaderId : null,
     updatedAt: toIso(d.updatedAt),
   };
 }
