@@ -11,6 +11,7 @@ import {
   MOCK_SETTINGS,
 } from "./mock";
 import {
+  CLASS_ROLE,
   DEFAULT_SETTINGS,
   FIELDS,
   FIELD_LABEL,
@@ -298,9 +299,15 @@ function serializeSettings(d: SettingsDoc | null): Settings {
   if (!d) return { ...DEFAULT_SETTINGS, updatedAt: new Date(0).toISOString() };
   // Normalize defensively (fill any missing class role, coerce numbers).
   const classRoles: Record<string, Role> = {};
+  // A class absent from the stored doc (i.e. one added to KNOWN_CLASSES after
+  // the doc was last saved) falls back to its CLASS_ROLE default, not a blanket
+  // "dps" — otherwise a newly-added Tank class (Paladin) would silently
+  // serialize as DPS until someone re-saved Settings. No-op for classes the
+  // doc already carries.
   for (const cls of KNOWN_CLASSES) {
     const r = d.classRoles?.[cls];
-    classRoles[cls] = r === "tank" || r === "healer" || r === "dps" ? r : "dps";
+    classRoles[cls] =
+      r === "tank" || r === "healer" || r === "dps" ? r : (CLASS_ROLE[cls] ?? "dps");
   }
   const requiredClasses = Array.isArray(d.requiredClasses)
     ? d.requiredClasses

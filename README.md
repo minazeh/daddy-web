@@ -89,9 +89,9 @@ server actions, so there is no hydration concern.
   all locks → a blank board. (Confirm prompt; destructive.)
 
 The role mapping is the `CLASS_ROLE` constant in `src/lib/types.ts` (easy to
-edit): **Tank** = Knight; **Healer** = Priest; **DPS** = Assassin, Hunter,
-Gunslinger, Blacksmith, Wizard, Druid. A member with an unknown/null `className`
-is generic DPS/flex and never counts as a Priest.
+edit): **Tank** = Knight, Paladin; **Healer** = Priest; **DPS** = Assassin,
+Hunter, Gunslinger, Blacksmith, Wizard, Druid, Monk. A member with an
+unknown/null `className` is generic DPS/flex and never counts as a Priest.
 
 ### Raid Groups page (`/raids`)
 

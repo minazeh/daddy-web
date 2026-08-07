@@ -96,7 +96,7 @@ type SortMode =
   | "attendance-asc";
 
 // Per-class table: sortable columns. `null` classSort = the fixed default
-// order (8 known classes + "Unknown/none" last), rendered identically on the
+// order (10 known classes + "Unknown/none" last), rendered identically on the
 // server and first client render. Only user clicks introduce client-only sort
 // state.
 type ClassSortColumn =
@@ -340,7 +340,7 @@ export function MembersDashboard({
     const rated = active.filter((m) => m.power > 0).length;
     const unrated = active.length - rated;
 
-    // Per-class rows (8 known + Unknown/none), from ACTIVE members. Roles come
+    // Per-class rows (10 known + Unknown/none), from ACTIVE members. Roles come
     // from settings.classRoles.
     const known = KNOWN_CLASSES as readonly string[];
     const classKeys = [...known, "Unknown/none"];

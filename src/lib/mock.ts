@@ -24,6 +24,8 @@ export const MOCK_MEMBERS: Member[] = [
   { userId: "s2", username: "acolyte_jo", displayName: "Acolyte Jo", avatarUrl: null, isMain: false, isSub: true, className: "Priest", classRoleId: null, updatedAt: now },
   { userId: "s3", username: "sparkles", displayName: "Sparkles", avatarUrl: null, isMain: false, isSub: true, className: "Wizard", classRoleId: null, updatedAt: now },
   { userId: "s4", username: "shadowfoot", displayName: "Shadowfoot", avatarUrl: null, isMain: false, isSub: true, className: "Rogue", classRoleId: null, updatedAt: now },
+  { userId: "s5", username: "shieldwall", displayName: "Shieldwall", avatarUrl: null, isMain: false, isSub: true, className: "Paladin", classRoleId: null, updatedAt: now },
+  { userId: "s6", username: "ironfist", displayName: "Iron Fist", avatarUrl: null, isMain: false, isSub: true, className: "Monk", classRoleId: null, updatedAt: now },
 ];
 
 // Mock assignments keyed on canonical ids (`${type}-${field}-${position}`) so

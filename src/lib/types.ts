@@ -181,6 +181,7 @@ export type Role = "tank" | "healer" | "dps";
 
 export const CLASS_ROLE: Record<string, Role> = {
   Knight: "tank",
+  Paladin: "tank",
   Priest: "healer",
   Assassin: "dps",
   Hunter: "dps",
@@ -188,6 +189,7 @@ export const CLASS_ROLE: Record<string, Role> = {
   Blacksmith: "dps",
   Wizard: "dps",
   Druid: "dps",
+  Monk: "dps",
 };
 
 // The class that satisfies the "a Priest in every party" hard rule.
@@ -225,7 +227,7 @@ export function partyHasPriest(
 //   partySize       — slots per party (was MAX_PARTY_SLOTS = 5).
 //   mainPartyCount / subPartyCount — parties seeded per field (was 12 / 18).
 
-// The 8 known classes (the editable Settings UI offers exactly these).
+// The 10 known classes (the editable Settings UI offers exactly these).
 export const KNOWN_CLASSES = [
   "Assassin",
   "Hunter",
@@ -235,6 +237,8 @@ export const KNOWN_CLASSES = [
   "Blacksmith",
   "Wizard",
   "Druid",
+  "Paladin",
+  "Monk",
 ] as const;
 
 export const ROLES: Role[] = ["tank", "healer", "dps"];
