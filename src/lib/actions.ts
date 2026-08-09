@@ -537,9 +537,11 @@ export async function setMemberPower(
       existing.power = value;
       existing.updatedAt = new Date().toISOString();
     }
-    // Power feeds Generate (/) and is shown on /members.
+    // Power feeds Generate (/), ranks the Polarity cohorts (/polarity-raids),
+    // and is shown on /members.
     revalidatePath("/members");
     revalidatePath("/");
+    revalidatePath("/polarity-raids");
     return { ok: true, userId, power: value };
   }
 
@@ -552,6 +554,8 @@ export async function setMemberPower(
   );
   revalidatePath("/members");
   revalidatePath("/");
+  // Power ranks the Polarity main/normal cohorts, so that board is stale too.
+  revalidatePath("/polarity-raids");
   return { ok: true, userId, power: value };
 }
 
