@@ -5,6 +5,14 @@ import { useDroppable } from "@dnd-kit/core";
 import { type Member, type Party } from "@/lib/types";
 import { MemberChip } from "./MemberChip";
 
+// The minimal party shape this card renders. Structural rather than the full
+// `Party` so the SAME card serves the GvG board and the Polarity Raids board
+// (`PolarityParty` satisfies it) — one card component, no duplicate.
+export type PartyCardParty = Pick<
+  Party,
+  "partyId" | "name" | "memberIds" | "lockedSlots"
+>;
+
 // A party card in the fixed field grid (no free repositioning).
 // - The HEADER shows the (renameable) party name + member count.
 // - Each filled SLOT holds a draggable member chip plus lock + remove controls.
@@ -106,7 +114,7 @@ export function PartyCard({
   missing = [],
   unavailableIds,
 }: {
-  party: Party;
+  party: PartyCardParty;
   membersById: Map<string, Member>;
   partySize: number;
   onRename: (partyId: string, name: string) => void;

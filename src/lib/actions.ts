@@ -12,13 +12,17 @@ import {
 } from "./data";
 import { MOCK_MEMBER_META, MOCK_RAID_GROUPS, MOCK_SETTINGS } from "./mock";
 import {
+  buildPlans,
+  generateCohorts,
+  slotsToMemberIds,
+  type PartyPlan,
+} from "./generate";
+import {
   normalizePower,
   raidGroupMemberIds,
-  roleFor,
   validateSettings,
   type Field,
   type Guild,
-  type Member,
   type Party,
   type RaidGroup,
   type Settings,
@@ -102,250 +106,15 @@ export async function renameParty(
 
 // ============================================================================
 // Roster auto-fill — Generate / Reset / Reset Lock (all scoped to ONE guild,
-// across BOTH its Main + Sub fields). Randomness lives here (server-side), so
-// there is no hydration concern.
-// ============================================================================
-
-// In-place Fisher–Yates shuffle (server-side randomness only).
-function shuffle<T>(arr: T[]): T[] {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
-}
-
-// The slot layout for a party during generation: a fixed-length (partySize)
-// array where LOCKED indexes keep their existing member (or stay empty), and
-// UNLOCKED indexes are the ones we (re)fill.
-interface PartyPlan {
-  partyId: string;
-  field: Field; // "main" (elite tier) | "sub" — Main is staffed first
-  slots: (string | null)[]; // length partySize; userId or null
-  locked: Set<number>;
-  // Count of RETAINED (locked) members of each className, so we know which
-  // required-class minimums are still unmet after locks.
-  classCounts: Map<string, number>;
-}
-
-// Persist every party's slots (compacted to memberIds, preserving order so a
-// locked slot keeps its index). We store memberIds as the slot array with nulls
-// removed BUT keeping positional meaning: a locked slot at index i must keep its
-// member at index i, so we write a length-5 array with empties trimmed only
-// from the tail — to keep lock indexes valid we store the full positional array
-// with nulls collapsed to a compact list while locks reference indexes. To keep
-// the existing (flat memberIds[i] == slot i) contract intact, we write the
-// positional array directly, replacing null with a removed entry only when no
-// later slot is filled. Simpler + correct: store the positional array verbatim
-// using a sentinel-free compaction that preserves indexes (we keep nulls as
-// gaps by writing the array up to the last filled/locked slot).
-function slotsToMemberIds(slots: (string | null)[]): string[] {
-  // Keep positional meaning up to the last occupied OR locked slot is handled
-  // by the caller; here we simply drop nulls, because the UI renders by
-  // sequential index and locks are re-derived per render. To preserve lock
-  // alignment we instead keep nulls as placeholders is NOT representable in a
-  // string[]. So generation writes a DENSE array and we re-align locks below.
-  return slots.filter((s): s is string => s !== null);
-}
-
-// Build the per-party plan from current parties: which slots are locked, which
-// (locked) members are pinned, and a count of retained members per className
-// (so we know which required-class minimums are already met by locked members).
-function buildPlans(
-  parties: Party[],
-  memberById: Map<string, Member>,
-  partySize: number,
-): PartyPlan[] {
-  return parties.map((p) => {
-    const locked = new Set(p.lockedSlots);
-    const slots: (string | null)[] = Array.from(
-      { length: partySize },
-      (_, i) => p.memberIds[i] ?? null,
-    );
-    // Unlocked slots start empty (their members return to the pool). Slots
-    // beyond partySize are already excluded by the Array length above.
-    for (let i = 0; i < partySize; i++) {
-      if (!locked.has(i)) slots[i] = null;
-    }
-    const classCounts = new Map<string, number>();
-    for (const uid of slots) {
-      if (!uid) continue;
-      const cls = memberById.get(uid)?.className ?? null;
-      if (cls) classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
-    }
-    return { partyId: p.partyId, field: p.field, slots, locked, classCounts };
-  });
-}
-
-// Core generation — POWER-AWARE, TWO-TIER (Main = elite, Sub = the rest),
-// SETTINGS-DRIVEN. Mutates plans' slots. Returns a map partyId → missing
-// required classNames (empty/absent = party meets all requirements).
+// across BOTH its Main + Sub fields).
 //
-// Rules (after locks; locked members count toward their party from the start):
-//   1. REQUIREMENTS hard rule, power-based + Main-first: for each required class
-//      (className, min), parties still short get members of that class — sorted
-//      by power DESC, MAIN parties first then SUB. Locked members of that class
-//      already count. Parties that can't be satisfied are flagged with the
-//      class(es) still missing.
-//   2. TIER PARTITION: rank the remaining available members by power DESC; the
-//      top fill MAIN up to its remaining free-slot capacity; rest → SUB.
-//   3. PER-FIELD BALANCE: within Main's parties (and separately within Sub's),
-//      a ~1-tank pass (using settings classRoles) then a largest-into-smallest-
-//      bin balance fill from that field's tier pool. Main is never balanced
-//      against Sub.
-// Randomness applies ONLY to ties (equal-power members shuffle).
-function generatePlans(
-  plans: PartyPlan[],
-  pool: Member[],
-  powerOf: (uid: string) => number,
-  classOf: (uid: string) => string | null,
-  settings: Settings,
-): Map<string, string[]> {
-  const { requiredClasses, classRoles } = settings;
-  const byPowerDesc = (list: Member[]) =>
-    shuffle(list.slice()).sort((a, b) => powerOf(b.userId) - powerOf(a.userId));
-
-  const used = new Set<string>();
-  const freeSlots = (plan: PartyPlan): number[] => {
-    const out: number[] = [];
-    for (let i = 0; i < plan.slots.length; i++) {
-      if (!plan.locked.has(i) && plan.slots[i] === null) out.push(i);
-    }
-    return out;
-  };
-  const place = (plan: PartyPlan, uid: string) => {
-    const free = freeSlots(plan);
-    if (free.length === 0) return false;
-    plan.slots[free[0]] = uid;
-    const cls = classOf(uid);
-    if (cls) plan.classCounts.set(cls, (plan.classCounts.get(cls) ?? 0) + 1);
-    return true;
-  };
-
-  const power = new Map<string, number>();
-  for (const plan of plans) {
-    let sum = 0;
-    for (const uid of plan.slots) if (uid) sum += powerOf(uid);
-    power.set(plan.partyId, sum);
-  }
-  const addPower = (plan: PartyPlan, uid: string) =>
-    power.set(plan.partyId, (power.get(plan.partyId) ?? 0) + powerOf(uid));
-
-  const lowestOpenIn = (
-    subset: PartyPlan[],
-    pred?: (p: PartyPlan) => boolean,
-  ): PartyPlan | null => {
-    let best: PartyPlan | null = null;
-    for (const plan of subset) {
-      if (freeSlots(plan).length === 0) continue;
-      if (pred && !pred(plan)) continue;
-      const pp = power.get(plan.partyId) ?? 0;
-      const bp = best ? (power.get(best.partyId) ?? 0) : 0;
-      if (
-        best === null ||
-        pp < bp ||
-        (pp === bp && plan.partyId.localeCompare(best.partyId) < 0)
-      ) {
-        best = plan;
-      }
-    }
-    return best;
-  };
-  const takeNext = (list: Member[]): Member | null => {
-    while (list.length) {
-      const m = list.shift()!;
-      if (!used.has(m.userId)) {
-        used.add(m.userId);
-        return m;
-      }
-    }
-    return null;
-  };
-
-  const mainPlans = plans.filter((p) => p.field === "main");
-  const subPlans = plans.filter((p) => p.field === "sub");
-
-  // ---- STEP 1: REQUIRED CLASSES, power DESC, Main parties first then Sub. ----
-  // Process each requirement; for its min, top up parties still short.
-  const needsClass = (plan: PartyPlan, cls: string, min: number) =>
-    (plan.classCounts.get(cls) ?? 0) < min && freeSlots(plan).length > 0;
-  for (const rc of requiredClasses) {
-    const pool_c = byPowerDesc(
-      pool.filter((m) => m.className === rc.className && !used.has(m.userId)),
-    );
-    const assignTo = (subset: PartyPlan[]) => {
-      // Keep going until no short party can be filled or the class pool dries.
-      let guard = subset.length * rc.min + 1;
-      while (guard-- > 0) {
-        const target = lowestOpenIn(subset, (p) =>
-          needsClass(p, rc.className, rc.min),
-        );
-        if (!target) break;
-        const m = takeNext(pool_c);
-        if (!m) break;
-        place(target, m.userId);
-        addPower(target, m.userId);
-      }
-    };
-    assignTo(mainPlans);
-    assignTo(subPlans);
-  }
-  // Flag parties still missing any required class.
-  const missing = new Map<string, string[]>();
-  for (const plan of plans) {
-    const miss = requiredClasses
-      .filter((rc) => (plan.classCounts.get(rc.className) ?? 0) < rc.min)
-      .map((rc) => rc.className);
-    if (miss.length > 0) missing.set(plan.partyId, miss);
-  }
-
-  // ---- STEP 2: TIER PARTITION of the remaining pool. ----
-  const remaining = byPowerDesc(pool.filter((m) => !used.has(m.userId)));
-  const mainCapacity = mainPlans.reduce((s, p) => s + freeSlots(p).length, 0);
-  const mainPool = remaining.slice(0, mainCapacity);
-  const subPool = remaining.slice(mainCapacity);
-
-  // ---- STEP 3: per-field fill — ~1 tank pass, then balance fill. ----
-  const fillField = (subset: PartyPlan[], fieldPool: Member[]) => {
-    const localUsed = new Set<string>();
-    const take = (pred: (m: Member) => boolean): Member | null => {
-      for (let i = 0; i < fieldPool.length; i++) {
-        const m = fieldPool[i];
-        if (localUsed.has(m.userId) || used.has(m.userId)) continue;
-        if (!pred(m)) continue;
-        localUsed.add(m.userId);
-        used.add(m.userId);
-        return m;
-      }
-      return null;
-    };
-
-    // Tank spread: ~1 tank into each lowest-power open party (within field).
-    for (let k = 0; k < subset.length; k++) {
-      const target = lowestOpenIn(subset);
-      if (!target) break;
-      const t = take((m) => roleFor(m.className, classRoles) === "tank");
-      if (!t) break;
-      place(target, t.userId);
-      addPower(target, t.userId);
-    }
-
-    // Balance fill: strongest remaining → lowest-power open party in this field.
-    for (const m of fieldPool) {
-      if (localUsed.has(m.userId) || used.has(m.userId)) continue;
-      const target = lowestOpenIn(subset);
-      if (!target) break;
-      localUsed.add(m.userId);
-      used.add(m.userId);
-      place(target, m.userId);
-      addPower(target, m.userId);
-    }
-  };
-  fillField(mainPlans, mainPool);
-  fillField(subPlans, subPool);
-
-  return missing;
-}
+// The composition engine itself now lives in ./generate.ts (extracted verbatim
+// so Polarity Raids can reuse it instead of forking a second generator). This
+// file supplies the GvG-specific wiring: two cohorts — Main field first, then
+// Sub field — with the legacy ordering (required classes across all cohorts,
+// THEN the power split) and the legacy random tie-break. Randomness lives
+// server-side, so there is no hydration concern.
+// ============================================================================
 
 export interface BulkResult extends ActionResult {
   parties?: Party[];
@@ -375,6 +144,17 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
 
   const plans = buildPlans(parties, memberById, settings.partySize);
 
+  // Two cohorts, in priority order: the Main field (elite tier) then the Sub
+  // field. `buildPlans` preserves the input order, so a partyId lookup keeps
+  // each plan paired with the party it came from.
+  const planById = new Map(plans.map((p) => [p.partyId, p]));
+  const cohortFor = (field: Field): PartyPlan[] =>
+    parties
+      .filter((p) => p.field === field)
+      .map((p) => planById.get(p.partyId))
+      .filter((p): p is PartyPlan => p !== undefined);
+  const cohorts = [cohortFor("main"), cohortFor("sub")];
+
   // Available pool = guild members NOT pinned in any locked slot.
   const pinned = new Set<string>();
   for (const plan of plans) {
@@ -385,7 +165,10 @@ export async function generateGuild(guild: Guild): Promise<GenerateResult> {
   }
   const pool = members.filter((m) => !pinned.has(m.userId));
 
-  const missing = generatePlans(plans, pool, powerOf, classOf, settings);
+  // Legacy GvG semantics: required classes first across BOTH cohorts (Main
+  // gets first pick), then the power split (Main absorbs its free capacity,
+  // Sub takes the rest), random tie-break. These are generateCohorts' defaults.
+  const missing = generateCohorts(cohorts, pool, powerOf, classOf, settings);
 
   // Persist. Compact each plan's slots to a memberIds array. To preserve lock
   // index alignment, we write the slots array with trailing nulls trimmed but
