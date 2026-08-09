@@ -23,6 +23,7 @@ import {
 import { MemberSessionStrip, STATUS_LABEL } from "./AttendanceCharts";
 import { setMemberPower } from "@/lib/actions";
 import { TopNav } from "./TopNav";
+import { PowerImportModal } from "./PowerImportModal";
 
 // Member management dashboard for ONE guild — two-pane:
 //   LEFT  = scrollable member list (search + sort), each card opens the modal.
@@ -218,6 +219,8 @@ export function MembersDashboard({
   // Per-class table sort. `null` = default fixed order (server-rendered);
   // set only by a header click (client-only).
   const [classSort, setClassSort] = useState<ClassSort | null>(null);
+  // CSV power importer (preview → apply). Scoped to THIS page's guild.
+  const [importOpen, setImportOpen] = useState(false);
   const [, startTransition] = useTransition();
 
   function handleClassSort(col: ClassSortColumn) {
@@ -426,6 +429,19 @@ export function MembersDashboard({
     }
   }
 
+  // Applied CSV import: fold the new power values into the local list so the
+  // list + analytics update immediately (the action already revalidated the
+  // server-rendered pages).
+  function handleImported(changes: { userId: string; power: number }[]) {
+    if (changes.length === 0) return;
+    const byId = new Map(changes.map((c) => [c.userId, c.power]));
+    setMembers((prev) =>
+      prev.map((m) =>
+        byId.has(m.userId) ? { ...m, power: byId.get(m.userId)! } : m,
+      ),
+    );
+  }
+
   // Latest session's trend point (guild-scoped, chronological → last).
   const latestTrend = useMemo(() => {
     const t = guildTrend(attendanceSessions, guild);
@@ -521,6 +537,14 @@ export function MembersDashboard({
             <div className="text-[10px] text-slate-500">
               {visible.length} shown · {a.active} active · {a.departed} departed
             </div>
+            {/* Bulk power import for THIS guild only (preview → apply). */}
+            <button
+              type="button"
+              onClick={() => setImportOpen(true)}
+              className="w-full rounded-md border border-indigo-400/30 bg-indigo-950/50 px-2.5 py-1.5 text-xs font-semibold text-indigo-100 hover:bg-indigo-900/60"
+            >
+              Import power CSV…
+            </button>
           </div>
 
           <div className="flex-1 space-y-2 overflow-y-auto p-3">
@@ -868,6 +892,14 @@ export function MembersDashboard({
           </div>
         </div>
       </div>
+
+      {importOpen && (
+        <PowerImportModal
+          guild={guild}
+          onClose={() => setImportOpen(false)}
+          onApplied={handleImported}
+        />
+      )}
 
       {selected && (
         <MemberModal
