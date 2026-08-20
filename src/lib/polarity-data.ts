@@ -28,9 +28,9 @@ import {
 // IMPORTANT — no revalidation from a read path. `reconcile()` below writes
 // during a render (pruning departed members), exactly like the GvG
 // `ensureGuildParties`, but it deliberately does NOT call `revalidatePath`.
-// Next throws when revalidation happens during render; the GvG path has a
-// known cold-load 500 for precisely that reason (data.ts:576). Revalidation
-// for this feature lives ONLY in the server actions.
+// Next throws when revalidation happens during render; the GvG path carried a
+// cold-load 500 for precisely that reason until its `reconcileParties` was
+// brought in line with this one. Revalidation lives ONLY in the server actions.
 // ============================================================================
 
 const POLARITY_RAIDS = "polarityRaids";

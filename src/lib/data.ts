@@ -1,5 +1,4 @@
 import "server-only";
-import { revalidatePath } from "next/cache";
 import { ObjectId } from "mongodb";
 import type { AnyBulkWriteOperation, Collection } from "mongodb";
 import { getDb, isMongoConfigured } from "./mongo";
@@ -524,6 +523,9 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
 // sat in a LOCKED slot, drop that index from lockedSlots too (locks reference
 // slot indexes into the compacting memberIds). Persists ONLY changed parties.
 // Race-safe: each write is an idempotent $set keyed on the unique partyId.
+// NO revalidatePath — this runs during render (same rule as the Polarity
+// `reconcile`, polarity-data.ts). Revalidation lives ONLY in the server
+// actions; see the note at the bulkWrite below.
 async function reconcileParties(
   col: Collection<PartyDoc>,
   parties: Party[],
@@ -570,11 +572,14 @@ async function reconcileParties(
   });
 
   // Only write when something actually changed (idempotent: zero orphans → zero
-  // writes). Revalidate so freed slots are immediately reusable.
-  if (writes.length > 0) {
-    await col.bulkWrite(writes, { ordered: false });
-    revalidatePath("/");
-  }
+  // writes). This used to also call revalidatePath("/") "so freed slots are
+  // immediately reusable", which threw a cold-load 500 on `/`, `/raids` and
+  // `/members` whenever there was anything to prune — Next forbids revalidation
+  // during render. It was never needed: we return `reconciled` (the pruned
+  // in-memory parties) and the caller renders THAT, so the freed slots are
+  // already visible on this very request, and the prune is persisted, so every
+  // later render reads the corrected state straight from the DB.
+  if (writes.length > 0) await col.bulkWrite(writes, { ordered: false });
 
   return reconciled;
 }
