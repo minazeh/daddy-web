@@ -285,6 +285,148 @@ export function guildTrend(
   });
 }
 
+// ---- server-side digest for /members ----
+//
+// /members needs per-member attendance for ~150 members, but the raw
+// `gvg_attendance` documents are enormous: 26 docs, avgObjSize 47 KB, 1.29 MB
+// total. Passing them into the client MembersDashboard put a measured 891 KB
+// RSC payload on every navigation - ~14x every other route, which ships ~60 KB.
+//
+// Nothing the dashboard does with them needs the raw documents: every use is a
+// derivation (memberAttendance per member, the latest trend point, the session
+// count). So the derivation happens on the server and only the RESULT crosses
+// the wire, in a shape built for the wire:
+//
+//   - session metadata is stored ONCE in `sessions` and referenced by index,
+//     instead of being repeated inside every member's rows;
+//   - VC labels are interned into `vcLabels` and referenced by index;
+//   - each row is a fixed 4-number tuple rather than a 7-key object;
+//   - `counted` is dropped - it is exactly (status === present || absent).
+//
+// `expandMemberAttendance` rebuilds a full MemberAttendance on the client, so
+// components keep working against the same type they always did.
+//
+// /attendance already proved the pattern: same source data, server-side
+// aggregation, 50.5 KB.
+
+export interface AttendanceSessionMeta {
+  sessionId: string;
+  date: string; // ISO startedAt
+  sessionLabel: string;
+}
+
+// Status order IS the wire encoding - append only, never reorder.
+const STATUS_CODES: MemberSessionStatus[] = [
+  "present",
+  "absent",
+  "present-uncounted",
+  "no-data",
+];
+
+// [sessionIndex, statusCode, flagged (0|1), vcLabelIndex (-1 = none)]
+export type PackedRow = [number, number, number, number];
+
+export interface PackedMemberAttendance {
+  rows: PackedRow[];
+  presentCount: number;
+  expectedCount: number;
+  ratePct: number | null;
+}
+
+export interface AttendanceDigest {
+  sessions: AttendanceSessionMeta[]; // chronological, guild-scoped
+  vcLabels: string[]; // interned row.vcLabel values
+  latest: TrendPoint | null; // newest guildTrend point
+  byMember: Record<string, PackedMemberAttendance>;
+}
+
+// Derive the whole dashboard's attendance data from the raw sessions. Server
+// side only in practice - it is the expensive part, and its output is what
+// crosses the RSC boundary.
+export function buildAttendanceDigest(
+  sessions: AttendanceSession[],
+  g: Guild,
+  userIds: string[],
+): AttendanceDigest {
+  const meta: AttendanceSessionMeta[] = sessions.map((s) => ({
+    sessionId: s.id,
+    date: s.startedAt,
+    sessionLabel: sessionDisplayLabel(s),
+  }));
+  const indexById = new Map(meta.map((m, i) => [m.sessionId, i]));
+
+  const vcLabels: string[] = [];
+  const vcIndex = new Map<string, number>();
+  const internVc = (label: string | null): number => {
+    if (label === null) return -1;
+    const hit = vcIndex.get(label);
+    if (hit !== undefined) return hit;
+    const next = vcLabels.length;
+    vcLabels.push(label);
+    vcIndex.set(label, next);
+    return next;
+  };
+
+  const byMember: Record<string, PackedMemberAttendance> = {};
+  for (const userId of userIds) {
+    const a = memberAttendance(sessions, g, userId);
+    byMember[userId] = {
+      presentCount: a.presentCount,
+      expectedCount: a.expectedCount,
+      ratePct: a.ratePct,
+      rows: a.rows.map((r): PackedRow => [
+        indexById.get(r.sessionId) ?? 0,
+        STATUS_CODES.indexOf(r.status),
+        r.flagged ? 1 : 0,
+        internVc(r.vcLabel),
+      ]),
+    };
+  }
+
+  const trend = guildTrend(sessions, g);
+  return {
+    sessions: meta,
+    vcLabels,
+    latest: trend.length > 0 ? trend[trend.length - 1] : null,
+    byMember,
+  };
+}
+
+const EMPTY_ATTENDANCE: MemberAttendance = {
+  rows: [],
+  presentCount: 0,
+  expectedCount: 0,
+  ratePct: null,
+};
+
+// Rebuild a full MemberAttendance from the packed digest. Pure, cheap, and
+// exact - the same value buildAttendanceDigest packed.
+export function expandMemberAttendance(
+  digest: AttendanceDigest,
+  userId: string,
+): MemberAttendance {
+  const packed = digest.byMember[userId];
+  if (!packed) return EMPTY_ATTENDANCE;
+  return {
+    presentCount: packed.presentCount,
+    expectedCount: packed.expectedCount,
+    ratePct: packed.ratePct,
+    rows: packed.rows.map(([sessionIdx, statusCode, flagged, vcIdx]) => {
+      const s = digest.sessions[sessionIdx];
+      const status = STATUS_CODES[statusCode] ?? "no-data";
+      return {
+        sessionId: s.sessionId,
+        date: s.date,
+        sessionLabel: s.sessionLabel,
+        vcLabel: vcIdx >= 0 ? digest.vcLabels[vcIdx] : null,
+        status,
+        counted: status === "present" || status === "absent",
+        flagged: flagged === 1,
+      };
+    }),
+  };
+}
+
 export interface LeaderboardRow {
   userId: string;
   displayName: string;

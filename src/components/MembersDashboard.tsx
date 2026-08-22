@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState, useTransition } from "react";
+import { useCallback, useMemo, useState, useTransition } from "react";
 import {
   KNOWN_CLASSES,
   normalizePower,
@@ -12,16 +12,14 @@ import {
   type Settings,
 } from "@/lib/types";
 import {
+  expandMemberAttendance,
   fmtDateShort,
   formatRate,
-  guildTrend,
-  memberAttendance,
-  type AttendanceSession,
-  type MemberAttendance,
+  type AttendanceDigest,
   type MemberSessionRow,
 } from "@/lib/attendance";
 import { MemberSessionStrip, STATUS_LABEL } from "./AttendanceCharts";
-import { setMemberPower } from "@/lib/actions";
+import { setMemberPower, syncRoster } from "@/lib/actions";
 import { TopNav } from "./TopNav";
 import { PowerImportModal } from "./PowerImportModal";
 
@@ -200,7 +198,7 @@ export function MembersDashboard({
   partyCount,
   assignedMemberIds,
   settings,
-  attendanceSessions,
+  attendance,
   persistenceEnabled,
 }: {
   guild: Guild;
@@ -208,7 +206,9 @@ export function MembersDashboard({
   partyCount: number;
   assignedMemberIds: string[];
   settings: Settings;
-  attendanceSessions: AttendanceSession[];
+  // Server-derived (members/page.tsx). The raw sessions never reach the client:
+  // they are 1.29 MB and everything here is an aggregate of them.
+  attendance: AttendanceDigest;
   persistenceEnabled: boolean;
 }) {
   const [members, setMembers] = useState<ManagedMember[]>(initial);
@@ -221,6 +221,9 @@ export function MembersDashboard({
   const [classSort, setClassSort] = useState<ClassSort | null>(null);
   // CSV power importer (preview → apply). Scoped to THIS page's guild.
   const [importOpen, setImportOpen] = useState(false);
+  // Roster sync (the memberMeta refresh that used to run on every page load).
+  const [syncing, setSyncing] = useState(false);
+  const [syncNote, setSyncNote] = useState<string | null>(null);
   const [, startTransition] = useTransition();
 
   function handleClassSort(col: ClassSortColumn) {
@@ -245,15 +248,19 @@ export function MembersDashboard({
     [members, selectedId],
   );
 
-  // Since-joined attendance rate per member, precomputed once so the sort
-  // comparator below doesn't recompute it per pairwise comparison.
-  const attendanceByMember = useMemo(() => {
-    const map = new Map<string, MemberAttendance>();
-    for (const m of members) {
-      map.set(m.userId, memberAttendance(attendanceSessions, guild, m.userId));
-    }
-    return map;
-  }, [members, attendanceSessions, guild]);
+  // Since-joined rate per member. Already computed on the server; the sort
+  // comparator below just needs cheap lookups, and a member with no digest
+  // entry (added between the render and a client-side update) sorts as "no
+  // roster data" rather than throwing.
+  const rateFor = useCallback(
+    (userId: string) =>
+      attendance.byMember[userId] ?? {
+        presentCount: 0,
+        expectedCount: 0,
+        ratePct: null,
+      },
+    [attendance],
+  );
 
   // ---- left list: filter + deterministic sort ----
   const visible = useMemo(() => {
@@ -300,8 +307,8 @@ export function MembersDashboard({
           return c !== 0 ? c : byNameThenId(a, b);
         }
         case "attendance-desc": {
-          const ra = attendanceByMember.get(a.userId)!;
-          const rb = attendanceByMember.get(b.userId)!;
+          const ra = rateFor(a.userId);
+          const rb = rateFor(b.userId);
           if (ra.expectedCount === 0 && rb.expectedCount === 0)
             return byNameThenId(a, b); // no roster data sorts last either way
           if (ra.expectedCount === 0) return 1;
@@ -311,8 +318,8 @@ export function MembersDashboard({
             : byNameThenId(a, b);
         }
         case "attendance-asc": {
-          const ra = attendanceByMember.get(a.userId)!;
-          const rb = attendanceByMember.get(b.userId)!;
+          const ra = rateFor(a.userId);
+          const rb = rateFor(b.userId);
           if (ra.expectedCount === 0 && rb.expectedCount === 0)
             return byNameThenId(a, b);
           if (ra.expectedCount === 0) return 1;
@@ -324,7 +331,7 @@ export function MembersDashboard({
       }
     });
     return filtered;
-  }, [members, query, sortMode, attendanceByMember]);
+  }, [members, query, sortMode, rateFor]);
 
   // ---- analytics (active members for stats unless noted) ----
   const a = useMemo(() => {
@@ -429,6 +436,28 @@ export function MembersDashboard({
     }
   }
 
+  // Refresh memberMeta from the live Discord roster: creates rows for new
+  // members, re-caches roster fields and stamps lastSeenAt (which is what makes
+  // someone show as DEPARTED once they leave). This is a WRITE, so it is an
+  // explicit action rather than a side effect of rendering the page — see the
+  // note on syncMemberMeta in data.ts. The action revalidates /members, so the
+  // server component re-runs and the list comes back updated.
+  async function handleSyncRoster() {
+    if (!persistenceEnabled || syncing) return;
+    setSyncing(true);
+    setSyncNote(null);
+    try {
+      const res = await syncRoster();
+      setSyncNote(
+        res.ok ? `Synced ${res.members ?? 0} rows` : (res.message ?? "Sync failed"),
+      );
+    } catch {
+      setSyncNote("Sync failed");
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   // Applied CSV import: fold the new power values into the local list so the
   // list + analytics update immediately (the action already revalidated the
   // server-rendered pages).
@@ -442,11 +471,10 @@ export function MembersDashboard({
     );
   }
 
-  // Latest session's trend point (guild-scoped, chronological → last).
-  const latestTrend = useMemo(() => {
-    const t = guildTrend(attendanceSessions, guild);
-    return t.length > 0 ? t[t.length - 1] : null;
-  }, [attendanceSessions, guild]);
+  // Latest session's trend point (guild-scoped, chronological → last), derived
+  // on the server alongside the per-member histories.
+  const latestTrend = attendance.latest;
+  const sessionCount = attendance.sessions.length;
 
   // Per-class table display order: `classSort === null` renders the fixed
   // default order (a.perClass, server-computed); a header click introduces
@@ -545,6 +573,19 @@ export function MembersDashboard({
             >
               Import power CSV…
             </button>
+            {/* The memberMeta refresh. Explicit, because it writes. */}
+            <button
+              type="button"
+              onClick={handleSyncRoster}
+              disabled={!persistenceEnabled || syncing}
+              title="Refresh cached roster fields + last-seen from the live Discord member list"
+              className="w-full rounded-md border border-slate-400/25 bg-slate-800/40 px-2.5 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-700/50 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {syncing ? "Syncing roster…" : "Sync roster"}
+            </button>
+            {syncNote && (
+              <div className="text-[10px] text-slate-400">{syncNote}</div>
+            )}
           </div>
 
           <div className="flex-1 space-y-2 overflow-y-auto p-3">
@@ -626,14 +667,14 @@ export function MembersDashboard({
                 GvG Attendance
               </div>
               <div className="text-xs text-slate-300">
-                {attendanceSessions.length === 0 ? (
+                {sessionCount === 0 ? (
                   <span className="text-slate-500">
                     No completed sessions yet.
                   </span>
                 ) : (
                   <>
-                    {attendanceSessions.length} session
-                    {attendanceSessions.length === 1 ? "" : "s"} tracked ·
+                    {sessionCount} session{sessionCount === 1 ? "" : "s"}{" "}
+                    tracked ·
                     latest: {latestTrend ? (
                       <>
                         <span className="font-semibold text-slate-100">
@@ -904,8 +945,7 @@ export function MembersDashboard({
       {selected && (
         <MemberModal
           member={selected}
-          guild={guild}
-          attendanceSessions={attendanceSessions}
+          attendance={attendance}
           onClose={() => setSelectedId(null)}
           onSave={handleSavePower}
           persistenceEnabled={persistenceEnabled}
@@ -931,26 +971,25 @@ function statusBadgeClass(row: MemberSessionRow): string {
 
 function MemberModal({
   member,
-  guild,
-  attendanceSessions,
+  attendance: digest,
   onClose,
   onSave,
   persistenceEnabled,
 }: {
   member: ManagedMember;
-  guild: Guild;
-  attendanceSessions: AttendanceSession[];
+  attendance: AttendanceDigest;
   onClose: () => void;
   onSave: (userId: string, power: number) => void;
   persistenceEnabled: boolean;
 }) {
   const [draft, setDraft] = useState(String(member.power));
 
-  // Session-by-session record + since-joined rate for THIS member in the
-  // page's guild. Pure derivation over the (already guild-scoped) sessions.
+  // Session-by-session record + since-joined rate for THIS member in the page's
+  // guild — unpacked from the server-derived digest (the raw sessions are not
+  // on the client).
   const attendance = useMemo(
-    () => memberAttendance(attendanceSessions, guild, member.userId),
-    [attendanceSessions, guild, member.userId],
+    () => expandMemberAttendance(digest, member.userId),
+    [digest, member.userId],
   );
 
   function save() {

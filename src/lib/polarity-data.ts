@@ -1,6 +1,7 @@
 import "server-only";
-import type { AnyBulkWriteOperation, Collection } from "mongodb";
+import type { AnyBulkWriteOperation } from "mongodb";
 import { getDb, isMongoConfigured } from "./mongo";
+import { ensureSchema } from "./bootstrap";
 import { getMembers, getSettings } from "./data";
 import type { Guild } from "./types";
 import {
@@ -158,23 +159,29 @@ function canonicalBoard(guild: Guild): PolarityBoard {
   return { raids, parties };
 }
 
-// Idempotently guarantee the 6-raid / 42-party structure for ONE guild and
-// return it. Never deletes: the structure is fixed, so there are no strays to
-// prune, and `$setOnInsert` leaves every existing assignment untouched.
-export async function ensurePolarityBoard(guild: Guild): Promise<PolarityBoard> {
+// SEED the 6-raid / 42-party structure for ONE guild - THE WRITE PATH. Never
+// deletes: the structure is fixed, so there are no strays to prune, and
+// `$setOnInsert` leaves every existing assignment untouched.
+//
+// Called from the settings action (a partySize change is the only thing that
+// can require the board to be re-capped) and, self-healing, from
+// getPolarityBoard when it finds a document missing. It is NOT on the
+// steady-state render path: a page view that finds the full board performs no
+// writes at all. Rendering /polarity-raids used to cost 8 writes - two
+// createIndex round trips, two seeding bulkWrites that inserted nothing, the
+// memberMeta sync and the settings upsert - ~363 ms of pure no-ops.
+export async function seedPolarityBoard(guild: Guild): Promise<PolarityBoard> {
   const canonical = canonicalBoard(guild);
   if (!isMongoConfigured) return canonical;
+
+  // The unique indexes are what make the upserts below race-safe, so the write
+  // path (and only the write path) waits for the schema bootstrap.
+  await ensureSchema();
 
   const settings = await getSettings();
   const db = await getDb();
   const raidCol = db.collection<PolarityRaidDoc>(POLARITY_RAIDS);
   const partyCol = db.collection<PolarityPartyDoc>(POLARITY_PARTIES);
-
-  // Unique indexes make the upsert seed race-safe.
-  await Promise.all([
-    raidCol.createIndex({ raidId: 1 }, { unique: true }),
-    partyCol.createIndex({ partyId: 1 }, { unique: true }),
-  ]);
 
   await raidCol.bulkWrite(
     canonical.raids.map((r) => ({
@@ -225,32 +232,48 @@ export async function ensurePolarityBoard(guild: Guild): Promise<PolarityBoard> 
     raidCol.find({ type: guild }).toArray(),
     partyCol.find({ type: guild }).toArray(),
   ]);
-  const raidById = new Map(raidDocs.map((d) => [d.raidId, d]));
-  const partyById = new Map(partyDocs.map((d) => [d.partyId, d]));
+  const assembled = assembleBoard(canonical, raidDocs, partyDocs);
 
-  // Read back in CANONICAL order, so the board is deterministic regardless of
-  // Mongo's natural order and immune to any unexpected extra document.
-  const raids = canonical.raids.map((r) => {
-    const doc = raidById.get(r.raidId);
-    return doc ? serializeRaid(doc, r) : r;
-  });
-  const parties = canonical.parties.map((p) => {
-    const doc = partyById.get(p.partyId);
-    return doc ? serializeParty(doc, p) : p;
-  });
-
-  // Reconcile against the live roster + the current party size.
+  // Reconcile against the live roster + the current party size, and PERSIST the
+  // corrections (this is the write path, so the DB is brought fully in line).
   const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
-  const reconciled = await reconcile(
-    partyCol,
-    parties,
+  const { parties, writes } = reconcile(
+    assembled.parties,
     validIds,
     settings.partySize,
   );
+  if (writes.length > 0) await partyCol.bulkWrite(writes, { ordered: false });
+  return { raids: dropOrphanLeaders(assembled.raids, parties), parties };
+}
 
-  // Drop a leader that is no longer in any of its raid's parties.
+// Read back in CANONICAL order, so the board is deterministic regardless of
+// Mongo's natural order and immune to any unexpected extra document.
+function assembleBoard(
+  canonical: PolarityBoard,
+  raidDocs: PolarityRaidDoc[],
+  partyDocs: PolarityPartyDoc[],
+): PolarityBoard {
+  const raidById = new Map(raidDocs.map((d) => [d.raidId, d]));
+  const partyById = new Map(partyDocs.map((d) => [d.partyId, d]));
+  return {
+    raids: canonical.raids.map((r) => {
+      const doc = raidById.get(r.raidId);
+      return doc ? serializeRaid(doc, r) : r;
+    }),
+    parties: canonical.parties.map((p) => {
+      const doc = partyById.get(p.partyId);
+      return doc ? serializeParty(doc, p) : p;
+    }),
+  };
+}
+
+// Drop a leader that is no longer in any of its raid's parties.
+function dropOrphanLeaders(
+  raids: PolarityRaid[],
+  parties: PolarityParty[],
+): PolarityRaid[] {
   const membersByRaid = new Map<string, Set<string>>();
-  for (const p of reconciled) {
+  for (const p of parties) {
     let set = membersByRaid.get(p.raidId);
     if (!set) {
       set = new Set<string>();
@@ -258,25 +281,31 @@ export async function ensurePolarityBoard(guild: Guild): Promise<PolarityBoard> 
     }
     for (const id of p.memberIds) set.add(id);
   }
-  const cleanedRaids = raids.map((r) =>
+  return raids.map((r) =>
     r.leaderId && !membersByRaid.get(r.raidId)?.has(r.leaderId)
       ? { ...r, leaderId: null }
       : r,
   );
-
-  return { raids: cleanedRaids, parties: reconciled };
 }
 
 // Remove any memberId no longer in this guild's roster, cap each party to
 // `partySize` (a shrunk party size frees overflow members back to the pool),
-// and re-key lockedSlots onto the compacted indexes. Persists ONLY the parties
-// that actually changed. NO revalidatePath — this runs during render.
-async function reconcile(
-  col: Collection<PolarityPartyDoc>,
+// and re-key lockedSlots onto the compacted indexes.
+//
+// PURE - it computes, it does not persist. It returns the corrected parties
+// PLUS the writes that would bring the DB in line; getPolarityBoard (a render)
+// renders the corrected parties and discards the writes, seedPolarityBoard (the
+// write path, reached from a server action) applies them. That is what keeps a
+// page view read-only. NO revalidatePath here or in either caller - this is
+// reachable during render.
+function reconcile(
   parties: PolarityParty[],
   validIds: Set<string>,
   partySize: number,
-): Promise<PolarityParty[]> {
+): {
+  parties: PolarityParty[];
+  writes: AnyBulkWriteOperation<PolarityPartyDoc>[];
+} {
   const writes: AnyBulkWriteOperation<PolarityPartyDoc>[] = [];
 
   const reconciled = parties.map((p) => {
@@ -315,13 +344,42 @@ async function reconcile(
     return { ...p, memberIds: nextMemberIds, lockedSlots: nextLocked };
   });
 
-  if (writes.length > 0) await col.bulkWrite(writes, { ordered: false });
-  return reconciled;
+  return { parties: reconciled, writes };
 }
 
-// Read the polarity board for ONE guild (seeds it on first access).
+// Read the polarity board for ONE guild. THE READ PATH - in the steady state it
+// issues three finds (raids, parties, and the guild roster for the reconcile)
+// and NO writes.
+//
+// Self-healing: if any canonical raid or party document is missing - a fresh
+// database, or a structure change - it falls through to seedPolarityBoard,
+// which is the write path. The check is free: it runs over the documents this
+// function had to read anyway.
 export async function getPolarityBoard(guild: Guild): Promise<PolarityBoard> {
-  return ensurePolarityBoard(guild);
+  const canonical = canonicalBoard(guild);
+  if (!isMongoConfigured) return canonical;
+
+  const settings = await getSettings();
+  const db = await getDb();
+  const raidCol = db.collection<PolarityRaidDoc>(POLARITY_RAIDS);
+  const partyCol = db.collection<PolarityPartyDoc>(POLARITY_PARTIES);
+
+  const [raidDocs, partyDocs] = await Promise.all([
+    raidCol.find({ type: guild }).toArray(),
+    partyCol.find({ type: guild }).toArray(),
+  ]);
+
+  const haveRaids = new Set(raidDocs.map((d) => d.raidId));
+  const haveParties = new Set(partyDocs.map((d) => d.partyId));
+  const incomplete =
+    canonical.raids.some((r) => !haveRaids.has(r.raidId)) ||
+    canonical.parties.some((p) => !haveParties.has(p.partyId));
+  if (incomplete) return seedPolarityBoard(guild);
+
+  const assembled = assembleBoard(canonical, raidDocs, partyDocs);
+  const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
+  const { parties } = reconcile(assembled.parties, validIds, settings.partySize);
+  return { raids: dropOrphanLeaders(assembled.raids, parties), parties };
 }
 
 export { POLARITY_RAIDS, POLARITY_PARTIES };

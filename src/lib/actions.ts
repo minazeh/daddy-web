@@ -9,7 +9,10 @@ import {
   getPowerMap,
   getRaidGroups,
   getSettings,
+  seedGuildParties,
+  syncMemberMeta,
 } from "./data";
+import { seedPolarityBoard } from "./polarity-data";
 import { MOCK_MEMBER_META, MOCK_RAID_GROUPS, MOCK_SETTINGS } from "./mock";
 import {
   buildPlans,
@@ -546,11 +549,20 @@ export async function setMemberPower(
   }
 
   const db = await getDb();
-  // Only update an EXISTING meta row's power (rows are created by the on-load
-  // sync). $set power + updatedAt; never touches cached roster fields here.
+  // Upsert: $set power + updatedAt, never touching the cached roster fields.
+  // This used to be a bare updateOne, on the assumption that "rows are created
+  // by the on-load sync" — but the sync no longer runs on load (it is the
+  // `syncRoster` action now), so rating a member who has never been synced has
+  // to create their row or the save would silently no-op. $setOnInsert seeds
+  // only the identity + a lastSeenAt stamp; the roster fields fill in on the
+  // next sync, and /members reads them live from `members` in the meantime.
   await db.collection(MEMBER_META).updateOne(
     { userId },
-    { $set: { power: value, updatedAt: new Date() } },
+    {
+      $set: { power: value, updatedAt: new Date() },
+      $setOnInsert: { userId, lastSeenAt: new Date() },
+    },
+    { upsert: true },
   );
   revalidatePath("/members");
   revalidatePath("/");
@@ -617,9 +629,21 @@ export async function updateSettings(next: Settings): Promise<SettingsResult> {
   }
 
   // A structural change reseeds both guilds (safe + idempotent). Counts/size are
-  // global, so reseed daddy AND mummy.
+  // global, so reseed daddy AND mummy — and the Polarity board too, whose
+  // parties are capped by the same partySize.
+  //
+  // This calls the SEED path explicitly. It used to call getParties(), which
+  // seeded as a side effect of reading; getParties is a pure read now (a page
+  // view must not write), so the one place that genuinely needs the reseed has
+  // to ask for it. Revalidation still happens below, in this action — never in
+  // a render path.
   if (structuralChange) {
-    await Promise.all([getParties("daddy"), getParties("mummy")]);
+    await Promise.all([
+      seedGuildParties("daddy"),
+      seedGuildParties("mummy"),
+      seedPolarityBoard("daddy"),
+      seedPolarityBoard("mummy"),
+    ]);
   }
 
   revalidatePath("/settings");
@@ -627,4 +651,48 @@ export async function updateSettings(next: Settings): Promise<SettingsResult> {
   revalidatePath("/members");
   revalidatePath("/raids");
   return { ok: true, settings: s };
+}
+
+// ============================================================================
+// ROSTER SYNC — the maintenance job that used to run on every page render.
+//
+// syncMemberMeta() upserts a memberMeta row for every member currently in the
+// bot's `members` collection: refreshes the cached roster fields + lastSeenAt,
+// creates rows (power 0) for new members, and never overwrites an existing
+// power. It is a 297-document bulk write measured at 279-308 ms, and it was
+// sitting on the critical path of `/`, `/members` and `/polarity-raids` because
+// getPowerMap and getMembersForManagement called it to READ.
+//
+// It is a write, so it belongs in an action. `/members` renders live roster
+// fields joined with stored power, so the pages are correct without it; what
+// the sync adds is (a) rows for brand-new members and (b) a fresh lastSeenAt,
+// which is what makes a member show as DEPARTED with a meaningful "last seen"
+// once they leave the server. Run it from the Sync roster button on /members.
+// ============================================================================
+
+export interface SyncResult extends ActionResult {
+  members?: number;
+}
+
+export async function syncRoster(): Promise<SyncResult> {
+  if (!isMongoConfigured) return NOT_CONFIGURED;
+
+  const meta = await syncMemberMeta();
+
+  // The roster just changed, so this is also the moment the boards are stale:
+  // reseed both guilds and the Polarity board, which PERSISTS the prune of
+  // members who have left. Renders prune in memory only (a page view must not
+  // write), so this is what actually clears departed ids out of the DB.
+  await Promise.all([
+    seedGuildParties("daddy"),
+    seedGuildParties("mummy"),
+    seedPolarityBoard("daddy"),
+    seedPolarityBoard("mummy"),
+  ]);
+
+  revalidatePath("/members");
+  revalidatePath("/");
+  revalidatePath("/polarity-raids");
+  revalidatePath("/raids");
+  return { ok: true, members: meta.size };
 }

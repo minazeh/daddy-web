@@ -1,7 +1,8 @@
 import "server-only";
 import { ObjectId } from "mongodb";
-import type { AnyBulkWriteOperation, Collection } from "mongodb";
+import type { AnyBulkWriteOperation } from "mongodb";
 import { getDb, isMongoConfigured } from "./mongo";
+import { ensureSchema } from "./bootstrap";
 import {
   MOCK_MEMBERS,
   MOCK_MEMBER_META,
@@ -174,11 +175,37 @@ async function getAllMembers(): Promise<Member[]> {
   return docs.map(serializeMember);
 }
 
-// Upsert memberMeta for every CURRENT member: refresh cached fields + lastSeenAt
-// and set power=0 for NEW members, but NEVER overwrite an existing member's
-// power (that's the manual rating). Idempotent + race-safe ($set cached fields,
-// $setOnInsert power). Returns a userId -> meta map for ALL meta rows.
+// Read every memberMeta row (userId -> meta). PURE READ — no index creation, no
+// upsert. `batchSize` is raised past the 483-row collection so the whole set
+// comes back in ONE round trip instead of the driver's default 101-doc first
+// batch + a getMore.
+async function readMemberMeta(): Promise<Map<string, MemberMeta>> {
+  if (!isMongoConfigured) return new Map(MOCK_MEMBER_META);
+  const db = await getDb();
+  const docs = await db
+    .collection<MemberMetaDoc>(MEMBER_META)
+    .find({})
+    .batchSize(5000)
+    .toArray();
+  const map = new Map<string, MemberMeta>();
+  for (const d of docs) map.set(d.userId, serializeMeta(d));
+  return map;
+}
+
+// MAINTENANCE JOB — NOT a read path. Upsert memberMeta for every CURRENT
+// member: refresh cached fields + lastSeenAt and set power=0 for NEW members,
+// but NEVER overwrite an existing member's power (that's the manual rating).
+// Idempotent + race-safe ($set cached fields, $setOnInsert power). Returns a
+// userId -> meta map for ALL meta rows.
+//
+// This used to run on every render of `/`, `/members` and `/polarity-raids`
+// (via getPowerMap / getMembersForManagement) — a 297-document bulkWrite,
+// measured at 279-308 ms, on the critical path of a read-only page view. It is
+// now called ONLY from the `syncRoster` server action (the "Sync roster" button
+// on /members). Rendering a page performs reads only; see AGENTS.md and the
+// performance audit.
 export async function syncMemberMeta(): Promise<Map<string, MemberMeta>> {
+  await ensureSchema();
   const current = await getAllMembers();
   const nowIso = new Date().toISOString();
 
@@ -204,7 +231,6 @@ export async function syncMemberMeta(): Promise<Map<string, MemberMeta>> {
 
   const db = await getDb();
   const col = db.collection<MemberMetaDoc>(MEMBER_META);
-  await col.createIndex({ userId: 1 }, { unique: true });
 
   if (current.length > 0) {
     await col.bulkWrite(
@@ -245,20 +271,54 @@ export async function syncMemberMeta(): Promise<Map<string, MemberMeta>> {
 // no longer in `members`, matched to the guild via cached isMain/isSub). Each
 // tagged `active`. Deterministically ordered (active first, then by power desc,
 // then displayName, then userId).
+//
+// PURE READ. This used to call syncMemberMeta() — a 297-doc bulkWrite on every
+// page view. It now joins the two collections in memory instead:
+//   - ACTIVE  : guild membership + every roster field comes from the LIVE
+//               `members` doc (fresher than the cached copy the sync wrote),
+//               power comes from memberMeta (0 when there is no row yet).
+//   - DEPARTED: the memberMeta row is the only record left, so its cached
+//               fields (incl. isMain/isSub) are used, exactly as before.
+// The upsert side of the sync is a maintenance job — see syncMemberMeta().
 export async function getMembersForManagement(
   guild: Guild,
 ): Promise<ManagedMember[]> {
-  const meta = await syncMemberMeta();
-  const current = await getAllMembers();
+  const [current, meta] = await Promise.all([getAllMembers(), readMemberMeta()]);
   const activeIds = new Set(current.map((m) => m.userId));
   const inGuild = (m: { isMain: boolean; isSub: boolean }) =>
     guild === "daddy" ? m.isMain : m.isSub;
 
   const out: ManagedMember[] = [];
-  for (const m of meta.values()) {
+
+  // Active members of THIS guild, live fields + power from meta.
+  for (const m of current) {
     if (!inGuild(m)) continue;
-    out.push({ ...m, active: activeIds.has(m.userId) });
+    const cached = meta.get(m.userId);
+    out.push({
+      userId: m.userId,
+      power: cached?.power ?? 0,
+      displayName: m.displayName,
+      username: m.username,
+      className: m.className,
+      classRoleId: m.classRoleId,
+      isMain: m.isMain,
+      isSub: m.isSub,
+      avatarUrl: m.avatarUrl,
+      // No meta row yet (never synced): the live doc's own updatedAt is the
+      // best "last seen" evidence available without writing.
+      lastSeenAt: cached?.lastSeenAt ?? m.updatedAt,
+      updatedAt: cached?.updatedAt ?? m.updatedAt,
+      active: true,
+    });
   }
+
+  // Departed members: a meta row whose userId is gone from `members`, matched
+  // to the guild by the cached flags the last sync wrote.
+  for (const m of meta.values()) {
+    if (activeIds.has(m.userId) || !inGuild(m)) continue;
+    out.push({ ...m, active: false });
+  }
+
   out.sort((a, b) => {
     if (a.active !== b.active) return a.active ? -1 : 1;
     if (a.power !== b.power) return b.power - a.power;
@@ -268,13 +328,38 @@ export async function getMembersForManagement(
   return out;
 }
 
-// Power lookup for the current guild's ACTIVE members (used by Generate). Keyed
-// userId -> power, default 0.
+// Power lookup keyed userId -> power (default 0 at every call site). Callers
+// hold their own guild-scoped member list and look up by userId, so the map is
+// deliberately NOT filtered by the cached isMain/isSub flags — a member who
+// changed guild since the last roster sync still resolves to their real power.
+//
+// PURE READ, ONE round trip. This used to call syncMemberMeta() — a full member
+// scan + createIndex + 297-doc bulkWrite + 483-doc meta scan, ~590-640 ms
+// strictly sequential, to build a read-only map. `batchSize` past the
+// collection size keeps it to a single round trip; the projection keeps the
+// documents to two fields.
 export async function getPowerMap(guild: Guild): Promise<Map<string, number>> {
-  const meta = await syncMemberMeta();
   const map = new Map<string, number>();
-  for (const m of meta.values()) {
-    if (guild === "daddy" ? m.isMain : m.isSub) map.set(m.userId, m.power);
+
+  if (!isMongoConfigured) {
+    for (const m of MOCK_MEMBER_META.values()) {
+      if (guild === "daddy" ? m.isMain : m.isSub) map.set(m.userId, m.power);
+    }
+    return map;
+  }
+
+  const db = await getDb();
+  const docs = await db
+    .collection<MemberMetaDoc>(MEMBER_META)
+    .find({})
+    .project<{ userId: string; power?: number }>({ userId: 1, power: 1, _id: 0 })
+    .batchSize(5000)
+    .toArray();
+  for (const d of docs) {
+    map.set(
+      d.userId,
+      typeof d.power === "number" && d.power >= 0 ? Math.floor(d.power) : 0,
+    );
   }
   return map;
 }
@@ -338,29 +423,22 @@ function serializeSettings(d: SettingsDoc | null): Settings {
   };
 }
 
-// Read the global settings, seeding DEFAULT_SETTINGS on first access (idempotent
-// upsert via $setOnInsert — re-running never overwrites edited values). Mock
-// mode reads the in-memory store.
+// Read the global settings. PURE READ — ONE round trip.
+//
+// This used to prefix every read with an idempotent `$setOnInsert` upsert to
+// seed DEFAULT_SETTINGS on first access. That made the single most-called read
+// in the app cost two round trips AND a write, on every render of every page.
+// The seed now runs once per server process from ensureSchema() (and again from
+// updateSettings), and a missing doc still degrades correctly: serializeSettings
+// (null) returns DEFAULT_SETTINGS, which is the value the seed would have
+// written anyway.
 export async function getSettings(): Promise<Settings> {
   if (!isMongoConfigured) return { ...MOCK_SETTINGS.value };
 
   const db = await getDb();
-  const col = db.collection<SettingsDoc>(SETTINGS);
-  await col.updateOne(
-    { _id: SETTINGS_ID },
-    {
-      $setOnInsert: {
-        requiredClasses: DEFAULT_SETTINGS.requiredClasses,
-        classRoles: DEFAULT_SETTINGS.classRoles,
-        partySize: DEFAULT_SETTINGS.partySize,
-        mainPartyCount: DEFAULT_SETTINGS.mainPartyCount,
-        subPartyCount: DEFAULT_SETTINGS.subPartyCount,
-        updatedAt: new Date(),
-      },
-    },
-    { upsert: true },
-  );
-  const doc = await col.findOne({ _id: SETTINGS_ID });
+  const doc = await db
+    .collection<SettingsDoc>(SETTINGS)
+    .findOne({ _id: SETTINGS_ID });
   return serializeSettings(doc);
 }
 
@@ -394,9 +472,52 @@ function blankParty(guild: Guild, field: Field, position: number): Party {
   };
 }
 
-// Idempotently guarantee the field structure for ONE guild: exactly
-// settings.mainPartyCount Main + settings.subPartyCount Sub blank parties,
-// keyed by `${type}-${field}-${position}`. Returns the canonical set (sorted).
+// Canonical partyId set for ONE guild, derived from the settings counts.
+function canonicalPartyIds(counts: Record<Field, number>, guild: Guild): Set<string> {
+  const canonical = new Set<string>();
+  for (const field of FIELDS) {
+    for (let i = 0; i < counts[field]; i++) {
+      canonical.add(partyIdFor(guild, field, i));
+    }
+  }
+  return canonical;
+}
+
+// The canonical structure synthesized in memory (mock mode — no DB at all).
+function mockGuildParties(guild: Guild, settings: Settings): Party[] {
+  const counts: Record<Field, number> = {
+    main: settings.mainPartyCount,
+    sub: settings.subPartyCount,
+  };
+  const out: Party[] = [];
+  for (const field of FIELDS) {
+    for (let i = 0; i < counts[field]; i++) {
+      out.push(blankParty(guild, field, i));
+    }
+  }
+  const valid = new Set(
+    MOCK_MEMBERS.filter((m) => (guild === "daddy" ? m.isMain : m.isSub)).map(
+      (m) => m.userId,
+    ),
+  );
+  for (const m of MOCK_PARTIES) {
+    const hit = out.find((p) => p.partyId === m.partyId);
+    if (hit) {
+      hit.memberIds = m.memberIds
+        .filter((id) => valid.has(id))
+        .slice(0, settings.partySize);
+    }
+  }
+  return out.sort(comparePartiesByOrder);
+}
+
+// SEED / RESEED the field structure for ONE guild — THE WRITE PATH.
+//
+// Called from the settings action (a counts / party-size change is the only
+// thing that makes the stored structure diverge from the canonical one) and,
+// self-healing, from getParties when it detects that divergence on read. It is
+// NEVER on the steady-state render path: a page view that finds the expected
+// party set performs no writes at all.
 //
 // SAFE RESEED on settings change (counts / party size):
 //   - Counts SHRINK   → out-of-range parties are deleted; their members simply
@@ -407,50 +528,25 @@ function blankParty(guild: Guild, field: Field, position: number): Party {
 //   - partySize SHRINKS → reconcile caps each party's memberIds + lockedSlots to
 //     partySize, freeing overflow members to the pool.
 // Idempotent + race-safe (unique partyId index + upsert/$setOnInsert).
-export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
+//
+// NO revalidatePath anywhere below — this is reachable from a render (the
+// self-heal) and Next forbids revalidation during render. Revalidation lives
+// ONLY in the server actions; see the note in reconcileParties.
+export async function seedGuildParties(guild: Guild): Promise<Party[]> {
   const settings = await getSettings();
+  if (!isMongoConfigured) return mockGuildParties(guild, settings);
+
+  // The unique partyId index is what makes the upsert below race-safe, so the
+  // write path (and only the write path) waits for the schema bootstrap.
+  await ensureSchema();
+
   const counts: Record<Field, number> = {
     main: settings.mainPartyCount,
     sub: settings.subPartyCount,
   };
-
-  if (!isMongoConfigured) {
-    // Mock mode: synthesize the canonical structure in memory (no DB writes).
-    const out: Party[] = [];
-    for (const field of FIELDS) {
-      for (let i = 0; i < counts[field]; i++) {
-        out.push(blankParty(guild, field, i));
-      }
-    }
-    const valid = new Set(
-      MOCK_MEMBERS.filter((m) => (guild === "daddy" ? m.isMain : m.isSub)).map(
-        (m) => m.userId,
-      ),
-    );
-    for (const m of MOCK_PARTIES) {
-      const hit = out.find((p) => p.partyId === m.partyId);
-      if (hit) {
-        hit.memberIds = m.memberIds
-          .filter((id) => valid.has(id))
-          .slice(0, settings.partySize);
-      }
-    }
-    return out.sort(comparePartiesByOrder);
-  }
-
   const db = await getDb();
   const col = db.collection<PartyDoc>(PARTIES);
-
-  // Unique index on partyId makes the upsert seed race-safe.
-  await col.createIndex({ partyId: 1 }, { unique: true });
-
-  // Canonical id set for this guild (from settings counts).
-  const canonical = new Set<string>();
-  for (const field of FIELDS) {
-    for (let i = 0; i < counts[field]; i++) {
-      canonical.add(partyIdFor(guild, field, i));
-    }
-  }
+  const canonical = canonicalPartyIds(counts, guild);
 
   // Find non-canonical (out-of-range / stray) parties for this guild BEFORE
   // deleting, so we can clean raid-group references to them.
@@ -501,37 +597,56 @@ export async function ensureGuildParties(guild: Guild): Promise<Party[]> {
   }
   if (ops.length > 0) await col.bulkWrite(ops, { ordered: false });
 
-  // Read back the canonical set, correcting field/position from the id for any
-  // legacy canonical-id doc that predated the `field` column.
   const docs = await col.find({ type: guild }).toArray();
-  const parties = docs
+  const parties = orderCanonicalParties(docs, canonical);
+
+  // Reconcile against the live roster + the current party size, and PERSIST the
+  // corrections (this is the write path, so the DB is brought fully in line).
+  const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
+  const { parties: reconciled, writes } = reconcileParties(
+    parties,
+    validIds,
+    settings.partySize,
+  );
+  if (writes.length > 0) await col.bulkWrite(writes, { ordered: false });
+  return reconciled;
+}
+
+// Deserialize + order the canonical subset of a guild's party docs, correcting
+// field/position from the id for any legacy canonical-id doc that predated the
+// `field` column.
+function orderCanonicalParties(
+  docs: PartyDoc[],
+  canonical: Set<string>,
+): Party[] {
+  return docs
     .filter((d) => canonical.has(d.partyId))
     .map(serializeParty)
     .map((p) => normalizeFieldFromId(p))
     .sort(comparePartiesByOrder);
-
-  // Reconcile against the live roster: prune userIds that are no longer in this
-  // guild's `members`, AND cap each party to settings.partySize (a shrunk party
-  // size frees overflow members to the pool). Idempotent: writes only changed
-  // parties.
-  const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
-  return reconcileParties(col, parties, validIds, settings.partySize);
 }
 
 // Remove any memberId not in `validIds` from each party's memberIds; cap to
 // `partySize` (overflow members return to the pool); and if a removed member
 // sat in a LOCKED slot, drop that index from lockedSlots too (locks reference
-// slot indexes into the compacting memberIds). Persists ONLY changed parties.
-// Race-safe: each write is an idempotent $set keyed on the unique partyId.
-// NO revalidatePath — this runs during render (same rule as the Polarity
-// `reconcile`, polarity-data.ts). Revalidation lives ONLY in the server
-// actions; see the note at the bulkWrite below.
-async function reconcileParties(
-  col: Collection<PartyDoc>,
+// slot indexes into the compacting memberIds).
+//
+// PURE — it computes, it does not persist. It returns the corrected parties
+// PLUS the writes that would bring the DB in line, and the CALLER decides:
+// getParties (a render) renders the corrected parties and discards the writes;
+// seedGuildParties (the write path, reached from a server action) applies them.
+// That is what keeps a page view read-only. A discarded write costs nothing:
+// the caller renders the corrected in-memory state, and the stale ids in the DB
+// are filtered out again on the next read and overwritten by the next mutation.
+//
+// NO revalidatePath here or in either caller — this is reachable during render
+// (same rule as the Polarity `reconcile`, polarity-data.ts). Revalidation lives
+// ONLY in the server actions; see the note at the end of this function.
+function reconcileParties(
   parties: Party[],
   validIds: Set<string>,
   partySize: number,
-): Promise<Party[]> {
+): { parties: Party[]; writes: AnyBulkWriteOperation<PartyDoc>[] } {
   const writes: AnyBulkWriteOperation<PartyDoc>[] = [];
 
   const reconciled = parties.map((p) => {
@@ -571,17 +686,14 @@ async function reconcileParties(
     return { ...p, memberIds: nextMemberIds, lockedSlots: nextLocked };
   });
 
-  // Only write when something actually changed (idempotent: zero orphans → zero
+  // `writes` is empty when nothing changed (idempotent: zero orphans → zero
   // writes). This used to also call revalidatePath("/") "so freed slots are
   // immediately reusable", which threw a cold-load 500 on `/`, `/raids` and
   // `/members` whenever there was anything to prune — Next forbids revalidation
   // during render. It was never needed: we return `reconciled` (the pruned
   // in-memory parties) and the caller renders THAT, so the freed slots are
-  // already visible on this very request, and the prune is persisted, so every
-  // later render reads the corrected state straight from the DB.
-  if (writes.length > 0) await col.bulkWrite(writes, { ordered: false });
-
-  return reconciled;
+  // already visible on this very request.
+  return { parties: reconciled, writes };
 }
 
 // Derive field/position from a canonical id `${type}-${field}-${position}` so a
@@ -603,9 +715,38 @@ function normalizeFieldFromId(p: Party): Party {
   return p;
 }
 
-// Read the canonical fixed-structure parties for ONE guild (seeds if needed).
+// Read the canonical fixed-structure parties for ONE guild. THE READ PATH — in
+// the steady state it issues exactly two finds (this guild's parties + the
+// guild roster for the reconcile) and NO writes.
+//
+// Self-healing: if the stored party set does not match the canonical set implied
+// by the settings counts — a fresh database, or a counts change that somehow
+// never went through the settings action — it falls through to
+// seedGuildParties, which is the write path. That check is free: it runs over
+// the documents this function had to read anyway.
 export async function getParties(guild: Guild): Promise<Party[]> {
-  return ensureGuildParties(guild);
+  const settings = await getSettings();
+  if (!isMongoConfigured) return mockGuildParties(guild, settings);
+
+  const counts: Record<Field, number> = {
+    main: settings.mainPartyCount,
+    sub: settings.subPartyCount,
+  };
+  const canonical = canonicalPartyIds(counts, guild);
+
+  const db = await getDb();
+  const col = db.collection<PartyDoc>(PARTIES);
+  const docs = await col.find({ type: guild }).toArray();
+
+  const stored = new Set(docs.map((d) => d.partyId));
+  const drifted =
+    stored.size !== canonical.size ||
+    Array.from(canonical).some((id) => !stored.has(id));
+  if (drifted) return seedGuildParties(guild);
+
+  const parties = orderCanonicalParties(docs, canonical);
+  const validIds = new Set((await getMembers(guild)).map((m) => m.userId));
+  return reconcileParties(parties, validIds, settings.partySize).parties;
 }
 
 // ---- Raid groups (the layer above parties) ----

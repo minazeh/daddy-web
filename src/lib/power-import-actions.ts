@@ -239,8 +239,10 @@ export async function applyPowerImport(
       const result = await db.collection(MEMBER_META).bulkWrite(
         writes.map((w) => ({
           updateOne: {
-            // No upsert — mirrors setMemberPower. Meta rows are created by the
-            // on-load sync; we only ever update an existing one's power.
+            // No upsert: a CSV import must not conjure rows for userIds that
+            // are not on the roster, so a miss is reported as `no-meta-row`
+            // below rather than silently inserted. (setMemberPower, which is
+            // always driven from a real member card, does upsert.)
             filter: { userId: w.userId },
             update: { $set: { power: w.power, updatedAt: new Date() } },
           },
@@ -258,7 +260,8 @@ export async function applyPowerImport(
             userId,
             displayName: w?.displayName ?? null,
             reason: "no-meta-row",
-            detail: "No memberMeta row — open /members once to create it.",
+            detail:
+              "No memberMeta row — run Sync roster on /members to create it.",
           });
         }
         for (let i = changes.length - 1; i >= 0; i--) {
