@@ -28,10 +28,28 @@ function getClientPromise(): Promise<MongoClient> {
         "guard reads/writes behind isMongoConfigured.",
     );
   }
-  if (!globalThis._mongoClientPromise) {
-    globalThis._mongoClientPromise = new MongoClient(uri).connect();
-  }
-  return globalThis._mongoClientPromise;
+  const cached = globalThis._mongoClientPromise;
+  if (cached) return cached;
+
+  const pending = new MongoClient(uri).connect();
+  globalThis._mongoClientPromise = pending;
+
+  // A REJECTED connect must not be cached. Without this, one transient failure
+  // — a DNS/SRV hiccup or a server-selection timeout on a serverless cold start
+  // — leaves a permanently rejected promise on `globalThis`, and every later
+  // getDb() on that instance re-throws it: a single blip bricks the whole
+  // container until it recycles. Dropping the memo lets the next caller retry
+  // with a fresh client. Same guard `ensureSchema` already applies to its own
+  // memo (see bootstrap.ts). The `=== pending` check makes it safe against a
+  // concurrent replacement; the handler swallows, so the returned promise (not
+  // this derived one) is what callers see reject.
+  pending.catch(() => {
+    if (globalThis._mongoClientPromise === pending) {
+      globalThis._mongoClientPromise = undefined;
+    }
+  });
+
+  return pending;
 }
 
 export async function getDb(): Promise<Db> {
