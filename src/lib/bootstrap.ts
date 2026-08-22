@@ -50,6 +50,8 @@ async function build(): Promise<void> {
     db.collection("parties").createIndex({ partyId: 1 }, { unique: true }),
     db.collection("polarityRaids").createIndex({ raidId: 1 }, { unique: true }),
     db.collection("polarityParties").createIndex({ partyId: 1 }, { unique: true }),
+    db.collection("siegeRaids").createIndex({ raidId: 1 }, { unique: true }),
+    db.collection("siegeParties").createIndex({ partyId: 1 }, { unique: true }),
     seedSettings(db),
   ]);
 }

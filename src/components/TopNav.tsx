@@ -12,6 +12,7 @@ export type NavKey =
   | "party"
   | "raid"
   | "polarity"
+  | "siege"
   | "members"
   | "attendance"
   | "settings";
@@ -20,6 +21,7 @@ const ITEMS: { key: NavKey; label: string; path: string }[] = [
   { key: "party", label: "Party Setup", path: "/" },
   { key: "raid", label: "Raid Setup", path: "/raids" },
   { key: "polarity", label: "Polarity Setup", path: "/polarity-raids" },
+  { key: "siege", label: "Siege", path: "/siege" },
   { key: "members", label: "Member Dashboard", path: "/members" },
   { key: "attendance", label: "Attendance", path: "/attendance" },
   { key: "settings", label: "Settings", path: "/settings" },
@@ -29,6 +31,7 @@ const BASE_PATH: Record<NavKey, string> = {
   party: "/",
   raid: "/raids",
   polarity: "/polarity-raids",
+  siege: "/siege",
   members: "/members",
   attendance: "/attendance",
   settings: "/settings",
