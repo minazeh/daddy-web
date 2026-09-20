@@ -50,6 +50,11 @@ async function build(): Promise<void> {
     db.collection("parties").createIndex({ partyId: 1 }, { unique: true }),
     db.collection("polarityRaids").createIndex({ raidId: 1 }, { unique: true }),
     db.collection("polarityParties").createIndex({ partyId: 1 }, { unique: true }),
+    // One imported DPS row per (guild, member). Unique so the import's upserts
+    // are race-safe, exactly like the party seeding above.
+    db
+      .collection("polarityDps")
+      .createIndex({ guild: 1, userId: 1 }, { unique: true }),
     db.collection("siegeRaids").createIndex({ raidId: 1 }, { unique: true }),
     db.collection("siegeParties").createIndex({ partyId: 1 }, { unique: true }),
     seedSettings(db),

@@ -13,12 +13,24 @@ import type { Guild } from "./types";
 // Everything here is scoped per guild — SIX raid groups PER GUILD.
 //
 // Structure (fixed; only `partySize` is configurable, via global Settings):
-//   2 "main"   raids x 5 parties  -> the top-power cohort
-//   4 "normal" raids x 8 parties  -> everyone else, split evenly
-// A raid's people cap is (parties x partySize): 25 for a main raid, 40 for a
-// normal raid at the default partySize of 5. The two main raids deliberately
-// run 5 parties rather than 8 because the top-50 cohort must SPLIT across two
-// raids — 50 people exceeds a single raid's 40-person cap.
+//   2 "main"   raids x 5 parties  -> the top cohort, ranked on imported DPS
+//   4 "normal" raids x 5 parties  -> everyone else, split evenly, ranked on power
+// EVERY raid is 5 parties x 5 members = 25 seats, so one guild's layout holds
+// 6 x 25 = 150 people at the default partySize.
+//
+// THE NORMAL RAIDS USED TO BE 8 PARTIES (210 per guild). Conrad cut them to 5
+// on 2026-09-20: a raid runs five parties in game, and 8 was inflating the
+// board with rows nobody used. The count lives in ONE place —
+// POLARITY_NORMAL_PARTY_COUNT below — so moving it back to 6 or 8 is a
+// one-line change.
+//
+// THE SURPLUS PARTY DOCUMENTS ARE HIDDEN, NOT DELETED. `polarityParties` still
+// holds the rows at positions 5-7 from when normal raids ran 8 parties. The
+// board is assembled from `polarityStructure`, which now stops at position 4,
+// so those rows are simply never read and never written (see
+// polarity-data.ts's canonicalBoard/assembleBoard, and the id-scoped
+// updateMany in resetLockPolarity). Raising the count again brings them back
+// with their old assignments intact. Nothing in the app deletes them.
 // ============================================================================
 
 export type PolarityKind = "main" | "normal";
@@ -31,10 +43,19 @@ export const POLARITY_RAID_COUNT: Record<PolarityKind, number> = {
   normal: 4,
 };
 
+// How many parties a MAIN raid holds.
+export const POLARITY_MAIN_PARTY_COUNT = 5;
+
+// How many parties a NORMAL raid holds. THE ONE LINE TO CHANGE if the raid
+// shape moves again — everything downstream (the seeded structure, the board,
+// the capacities, the UI grid, the generator's quotas) derives from it. Was 8
+// until 2026-09-20.
+export const POLARITY_NORMAL_PARTY_COUNT = 5;
+
 // How many parties each raid of that kind holds.
 export const POLARITY_PARTY_COUNT: Record<PolarityKind, number> = {
-  main: 5,
-  normal: 8,
+  main: POLARITY_MAIN_PARTY_COUNT,
+  normal: POLARITY_NORMAL_PARTY_COUNT,
 };
 
 // Total raid groups per guild — SIX.
@@ -46,8 +67,9 @@ export const POLARITY_KIND_LABEL: Record<PolarityKind, string> = {
   normal: "Raid",
 };
 
-// Cards per row in the party grid (mirrors CARDS_PER_ROW on the GvG board, but
-// a main raid is exactly 5 parties wide so a 5-column grid lays out cleanly).
+// Cards per row in the party grid (mirrors CARDS_PER_ROW on the GvG board).
+// Every raid is now exactly 5 parties, so each raid renders as exactly ONE row
+// of 5 cards.
 export const POLARITY_CARDS_PER_ROW = 5;
 
 // ---- Documents ------------------------------------------------------------
@@ -139,6 +161,23 @@ export function polarityStructure(guild: Guild): PolarityRaidSpec[] {
   return out;
 }
 
+// Every party id one guild's VISIBLE board is made of, in board order.
+//
+// This is the guard that keeps the hidden surplus parties (positions 5-7, left
+// over from the 8-party era) untouched: any collection-wide write must be
+// scoped to these ids rather than to `{ type: guild }`, which would sweep the
+// hidden rows in too. Derived from the structure, so it shrinks and grows with
+// POLARITY_NORMAL_PARTY_COUNT automatically.
+export function polarityPartyIds(guild: Guild): string[] {
+  const out: string[] = [];
+  for (const spec of polarityStructure(guild)) {
+    for (let i = 0; i < spec.partyCount; i++) {
+      out.push(polarityPartyId(spec.raidId, i));
+    }
+  }
+  return out;
+}
+
 // People cap for one raid of this kind = parties x partySize.
 export function polarityRaidCapacity(
   kind: PolarityKind,
@@ -147,14 +186,17 @@ export function polarityRaidCapacity(
   return POLARITY_PARTY_COUNT[kind] * partySize;
 }
 
-// The size of the top-power cohort = everything the two main raids can hold.
+// The size of the top cohort = everything the two main raids can hold.
 // 2 x 5 x 5 = 50 at the default partySize.
 export function polarityMainCohortSize(partySize: number): number {
   return POLARITY_RAID_COUNT.main * polarityRaidCapacity("main", partySize);
 }
 
 // Total people one guild's polarity layout can hold.
-// (2 x 5 + 4 x 8) x partySize = 42 x partySize = 210 at the default.
+// (2 x 5 + 4 x 5) x partySize = 30 x partySize = 150 at the default.
+// (It was 210 while the normal raids ran 8 parties. Dropping to 150 is
+// deliberate and it fits: the live rosters are 147 and 150. Anyone beyond
+// capacity stays UNASSIGNED in the pool — never dropped.)
 export function polarityTotalCapacity(partySize: number): number {
   return (
     POLARITY_RAID_COUNT.main * polarityRaidCapacity("main", partySize) +
@@ -229,4 +271,19 @@ export function polarityQuotas(
   const mainQuotas = evenQuotas(mainTake, mainCaps);
   const normalQuotas = evenQuotas(remaining - sum(mainQuotas), normalCaps);
   return [...mainQuotas, ...normalQuotas];
+}
+
+// The quota function for the NORMAL raids ALONE, used since the DPS ranking
+// took over the two main raids: the main raids are filled first by
+// fillMainRaidsByDps (polarity-generate.ts) and whoever is left goes through
+// generateCohorts with just the 4 normal cohorts.
+//
+// It is deliberately the SAME even split polarityQuotas applies to its normal
+// tail, so the four normal raids come out exactly as they always did for a
+// given pool — that equality is what scripts/verify-polarity-dps.ts proves.
+export function polarityNormalQuotas(
+  capacities: number[],
+  remaining: number,
+): number[] {
+  return evenQuotas(remaining, capacities);
 }

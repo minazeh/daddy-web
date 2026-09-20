@@ -19,12 +19,26 @@ import {
 //
 // Two NEW web-owned collections, fully isolated from the GvG structure:
 //   polarityRaids   — the 6 raid groups per guild (name + leader).
-//   polarityParties — their parties (5 per main raid, 8 per normal raid).
+//   polarityParties — their parties (5 per raid, every raid).
 // The existing `parties` / `raidGroups` collections are never touched here.
 //
 // The structure is FIXED, so seeding is a pure idempotent upsert: canonical
 // ids are computed from the structure and `$setOnInsert` never disturbs an
 // existing assignment. Nothing is ever deleted.
+//
+// HIDDEN SURPLUS PARTIES. Normal raids ran 8 parties until 2026-09-20; the
+// documents at positions 5-7 are still in `polarityParties`, with whatever
+// they last held. They are HIDDEN, NOT DELETED (Conrad's call). Every read
+// path here is driven by `canonicalBoard` → `polarityStructure`, which now
+// stops at position 4, so:
+//   - assembleBoard never returns them, and the board's `parties` array — the
+//     one the UI counts "assigned" and "unassigned" from — is visible-only, so
+//     a member sitting in a hidden row counts as UNASSIGNED and comes back to
+//     the pool, which is exactly right;
+//   - `reconcile` only ever walks the assembled (visible) parties, so it can
+//     neither prune nor rewrite them;
+//   - the seeding bulkWrite addresses canonical ids only, with $setOnInsert.
+// Raising POLARITY_NORMAL_PARTY_COUNT again brings them back untouched.
 //
 // IMPORTANT — no revalidation from a read path. `reconcile()` below writes
 // during a render (pruning departed members), exactly like the GvG
@@ -140,7 +154,9 @@ function serializeParty(
 
 export interface PolarityBoard {
   raids: PolarityRaid[]; // always 6, in structural order
-  parties: PolarityParty[]; // always 2*5 + 4*8 = 42, grouped by raid then position
+  // Always 6*5 = 30, grouped by raid then position. VISIBLE parties only —
+  // the hidden surplus rows (positions 5-7 of a normal raid) are not here.
+  parties: PolarityParty[];
 }
 
 // The canonical (all-blank) board for a guild — used as the mock-mode result
@@ -159,7 +175,7 @@ function canonicalBoard(guild: Guild): PolarityBoard {
   return { raids, parties };
 }
 
-// SEED the 6-raid / 42-party structure for ONE guild - THE WRITE PATH. Never
+// SEED the 6-raid / 30-party structure for ONE guild - THE WRITE PATH. Never
 // deletes: the structure is fixed, so there are no strays to prune, and
 // `$setOnInsert` leaves every existing assignment untouched.
 //

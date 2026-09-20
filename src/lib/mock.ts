@@ -1,3 +1,4 @@
+import type { StoredDps } from "./ranking-import";
 import {
   DEFAULT_SETTINGS,
   type Member,
@@ -43,6 +44,7 @@ declare global {
   var _mockRaidGroups: RaidGroup[] | undefined;
   var _mockMemberMeta: Map<string, MemberMeta> | undefined;
   var _mockSettings: { value: Settings } | undefined;
+  var _mockPolarityDps: Map<string, StoredDps> | undefined;
 }
 
 // Mutable in-memory settings store for mock mode (globalThis-cached). Seeded
@@ -78,3 +80,15 @@ export const MOCK_MEMBER_META: Map<string, MemberMeta> =
       },
     ]),
   ));
+
+// Mutable in-memory store for the imported polarity DPS rows in mock mode.
+// Keyed `${guild}:${userId}` because a row is scoped to one guild, exactly as
+// the real `polarityDps` collection is. Starts EMPTY: with no import there is
+// no DPS data, which is the honest no-DB state — the main raids then report
+// that nobody is eligible rather than silently inventing figures.
+export const MOCK_POLARITY_DPS: Map<string, StoredDps> =
+  globalThis._mockPolarityDps ?? (globalThis._mockPolarityDps = new Map());
+
+export function mockDpsKey(guild: string, userId: string): string {
+  return `${guild}:${userId}`;
+}

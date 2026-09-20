@@ -1,32 +1,54 @@
-// CSV power-rating import: parsing, name normalization and member matching.
+// CSV power-rating import: CSV parsing, power-cell parsing, and the preview /
+// apply plan.
 //
 // PURE module — no Mongo, no Next, no "server-only". Everything here is a
 // deterministic function over plain data so the exact same code can be unit
 // tested standalone and reused by the server action (src/lib/power-import-actions.ts)
 // and the preview UI (src/components/PowerImportModal.tsx).
 //
-// WHY NAME MATCHING AT ALL: the CSV's join key is the in-game name (IGN), and
-// IGN is not stored anywhere in the database. What we have is `members.displayName`,
-// which the bot's membersync writes as the Discord server NICKNAME (falling back
-// to username). Guild onboarding tells members to set their nickname to their
-// IGN, so displayName is the de-facto IGN — but it is human-typed, so it drifts:
-// homoglyphs (ApoIIo / Kıte / Skÿlash / O1teen), decoration after a separator
-// ("Oppades | Gem"), trailing punctuation ("Juls."), and outright spelling drift.
-//
-// THREE TIERS, and the tier decides how much trust the row gets:
-//   exact     — canonical key equality (NFKC + zero-width strip + whitespace
-//               collapse + case fold). Auto-selected.
-//   suggested — an aggressive fold (diacritics, confusables, punctuation),
-//               a separator prefix on either side, a username hit, containment,
-//               or bigram similarity. NEVER auto-applied; needs confirmation.
-//   unmatched — no candidate above threshold. The user picks or skips.
-// Anything malformed is `error` and carries a per-row reason (a bad row never
-// fails the whole file).
+// NAME MATCHING LIVES IN ./name-match. It used to live here, and was extracted
+// so the Polarity DPS ranking importer (./ranking-import) could reuse the exact
+// same three-tier engine — exact / suggested / unmatched — instead of copying
+// it. Everything this module used to export from that half is re-exported
+// below, so this file's public surface is unchanged. The extraction is pinned
+// by scripts/verify-power-import.ts, whose expected digest was captured from
+// the pre-extraction code.
 //
 // Power ratings are hand-maintained data: this module only ever DESCRIBES what
 // an import would do. Nothing here writes.
 
-import { GUILD_LABEL, normalizePower, type Guild } from "./types";
+import { normalizePower, type Guild } from "./types";
+import {
+  canonicalName,
+  matchNames,
+  membersNotCovered,
+  type Candidate,
+  type CrossGuildHit,
+  type MatchTier,
+  type NameEntry,
+  type RosterMember,
+} from "./name-match";
+
+// The matcher's surface, re-exported so existing callers (the server action,
+// the preview modal, the verification script) import it from here exactly as
+// they always did.
+export {
+  canonicalName,
+  foldName,
+  prefixBeforeSeparator,
+  diceSimilarity,
+  matchNames,
+  MAX_CANDIDATES,
+  MIN_CONTAINMENT_LEN,
+  SUGGEST_THRESHOLD,
+} from "./name-match";
+export type {
+  Candidate,
+  CrossGuildHit,
+  MatchTier,
+  NameEntry,
+  RosterMember,
+} from "./name-match";
 
 // ---------------------------------------------------------------------------
 // Limits (defence in depth — also enforced in the server action).
@@ -34,13 +56,6 @@ import { GUILD_LABEL, normalizePower, type Guild } from "./types";
 
 export const MAX_CSV_CHARS = 1_000_000;
 export const MAX_CSV_ROWS = 5_000;
-
-// Score at/above which a fuzzy candidate is worth pre-selecting as a suggestion.
-export const SUGGEST_THRESHOLD = 0.5;
-// Shortest needle allowed for the "one name contains the other" heuristic.
-export const MIN_CONTAINMENT_LEN = 3;
-// How many candidates to surface per row.
-export const MAX_CANDIDATES = 5;
 
 // ---------------------------------------------------------------------------
 // CSV parsing (RFC 4180-ish): quoted fields, "" escapes, CRLF/LF/CR, BOM,
@@ -262,147 +277,6 @@ export function parsePowerCell(raw: string): PowerParse {
   return { ok: true, value, note, reason: null };
 }
 
-// ---------------------------------------------------------------------------
-// Name normalization
-// ---------------------------------------------------------------------------
-
-// Zero-width / invisible formatting characters + soft hyphen.
-const INVISIBLE_RE = /[­​-‏⁠⁡⁢⁣⁤﻿]/g;
-
-/**
- * TIER-1 key. Conservative: NFKC, strip invisibles, collapse whitespace, trim,
- * case fold. Two names equal under this are treated as the same person and the
- * row is auto-selected.
- */
-export function canonicalName(s: string): string {
-  return (s ?? "")
-    .normalize("NFKC")
-    .replace(INVISIBLE_RE, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-// Letters that survive NFKC/NFD but read as another letter.
-const LETTER_CONFUSABLES: [RegExp, string][] = [
-  [/[ıİ]/g, "i"], // ı dotless i, İ dotted capital I
-  [/[łŁŀĿ]/g, "l"], // ł Ł ŀ Ŀ
-  [/[øØǿǾ]/g, "o"], // ø Ø ǿ Ǿ
-  [/[đĐðÐ]/g, "d"], // đ Đ ð Ð
-  [/[æÆ]/g, "ae"],
-  [/[œŒ]/g, "oe"],
-  [/[þÞ]/g, "th"],
-  [/[ß]/g, "ss"],
-  [/[ħĦ]/g, "h"],
-  [/[ŧŦ]/g, "t"],
-];
-
-// Punctuation + whitespace to drop entirely in the aggressive fold.
-// ASCII punctuation ranges + general punctuation + CJK/fullwidth punctuation.
-// (Deliberately NOT \p{...} — the tsconfig target predates property escapes.)
-const FOLD_STRIP_RE =
-  /[\s!-\/:-@\[-`{-~ -⁯　-〿！-／：-＠［-｀｛-･]/g;
-
-// Combining marks left over after NFD.
-const COMBINING_RE = /[̀-ͯ᪰-᫿᷀-᷿⃐-⃰]/g;
-
-/**
- * TIER-2 key. Everything canonicalName does, plus: letter confusables,
- * diacritic strip (NFD + combining-mark removal), all punctuation/whitespace
- * removed, and the two confusable digit/letter classes folded —
- *   i l 1 | ! ¡  -> "1"      (ApoIIo == Apollo, Kıte == Kite)
- *   o 0 ° º      -> "0"      (O1teen == 01teen)
- * Non-Latin scripts (CJK etc.) pass through untouched.
- * A fold hit is only ever a SUGGESTION — it is never auto-applied.
- */
-export function foldName(s: string): string {
-  let t = canonicalName(s);
-  for (const [re, to] of LETTER_CONFUSABLES) t = t.replace(re, to);
-  t = t.normalize("NFD").replace(COMBINING_RE, "").normalize("NFC");
-  t = t.replace(FOLD_STRIP_RE, "");
-  t = t.replace(/[il|!¡]/g, "1");
-  t = t.replace(/[o°º]/g, "0");
-  return t;
-}
-
-// A separator that introduces decoration: "Oppades | Gem", "MinROO/Mintz",
-// "笑熙熙 - Hoontar", "Madame~". A bare hyphen only counts when it is spaced,
-// so a hyphenated name ("Dr-Beast") is left alone.
-const SEPARATOR_RE = /\s*[|/\\~,;:•·–—]\s*|\s+[-]\s+|\s*[([{【「]\s*/;
-
-/** The part of a name before its first decoration separator, or null. */
-export function prefixBeforeSeparator(s: string): string | null {
-  const src = (s ?? "").trim();
-  const m = SEPARATOR_RE.exec(src);
-  if (!m || m.index <= 0) return null;
-  const head = src.slice(0, m.index).trim();
-  if (!head || head === src) return null;
-  if (head.length < 2) return null;
-  return head;
-}
-
-/** Sørensen–Dice coefficient over character bigrams of two folded strings. */
-export function diceSimilarity(a: string, b: string): number {
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
-  const bigrams = new Map<string, number>();
-  for (let i = 0; i < a.length - 1; i++) {
-    const g = a.slice(i, i + 2);
-    bigrams.set(g, (bigrams.get(g) ?? 0) + 1);
-  }
-  let hits = 0;
-  for (let i = 0; i < b.length - 1; i++) {
-    const g = b.slice(i, i + 2);
-    const n = bigrams.get(g) ?? 0;
-    if (n > 0) {
-      bigrams.set(g, n - 1);
-      hits++;
-    }
-  }
-  return (2 * hits) / (a.length - 1 + (b.length - 1));
-}
-
-// ---------------------------------------------------------------------------
-// Matching
-// ---------------------------------------------------------------------------
-
-/** The subset of a member the importer needs. Always ONE guild's roster. */
-export interface RosterMember {
-  userId: string;
-  displayName: string;
-  username: string;
-  className: string | null;
-  power: number;
-}
-
-export type MatchTier = "exact" | "suggested" | "unmatched" | "error";
-
-export interface Candidate {
-  userId: string;
-  displayName: string;
-  /** 0–1; 1 is a fold-exact hit. */
-  score: number;
-  /** Human-readable why, shown next to the candidate. */
-  reason: string;
-}
-
-/**
- * A CSV row that resolves to a member of the OTHER guild. Reported explicitly
- * rather than as a bare "not found": the row is data that went nowhere, and the
- * reason ("that's a Mummy member, you're importing Daddy") is the actionable
- * part. Never importable — imports never cross guilds.
- */
-export interface CrossGuildHit {
-  userId: string;
-  displayName: string;
-  /** The guild the hit belongs to (i.e. NOT the one being imported). */
-  guild: Guild;
-  guildLabel: string;
-  /** "exact" = canonical name equality, "fold" = matched after folding. */
-  via: "exact" | "fold";
-}
-
 export interface PreviewRow {
   /** 1-based index among DATA rows (header excluded). */
   rowNumber: number;
@@ -463,7 +337,7 @@ export function membersNotInCsv(
   roster: RosterMember[],
   covered: Set<string>,
 ): RosterMember[] {
-  return roster.filter((m) => !covered.has(m.userId));
+  return membersNotCovered(roster, covered);
 }
 
 /** Tab-separated dump of the unresolved rows, for pasting back into a sheet. */
@@ -482,24 +356,13 @@ export function unresolvedAsTsv(rows: PreviewRow[]): string {
   return [header, ...body].join("\n");
 }
 
-interface MemberKeys {
-  member: RosterMember;
-  canon: string;
-  fold: string;
-  prefixFold: string | null;
-  usernameFold: string;
-}
-
-function pushMulti<T>(map: Map<string, T[]>, key: string, value: T) {
-  if (!key) return;
-  const list = map.get(key);
-  if (list) list.push(value);
-  else map.set(key, [value]);
-}
-
 /**
  * Build the preview for one guild's roster. PURE — the caller supplies the
  * roster; this never touches a database.
+ *
+ * Two halves: the CSV-SPECIFIC half (delimiter, header, power cell, duplicate
+ * IGN) lives here; the name matching is delegated to `matchNames` in
+ * ./name-match, which the polarity DPS ranking importer calls the same way.
  *
  * `otherRoster` is the OTHER guild's active roster. It is used for REPORTING
  * ONLY: a CSV row that resolves there is flagged with an explicit reason
@@ -552,85 +415,18 @@ export function buildPreview(
     };
   }
 
-  // ---- index the roster -------------------------------------------------
-  const keyed: MemberKeys[] = roster.map((member) => {
-    const prefix = prefixBeforeSeparator(member.displayName);
-    return {
-      member,
-      canon: canonicalName(member.displayName),
-      fold: foldName(member.displayName),
-      prefixFold: prefix ? foldName(prefix) : null,
-      usernameFold: foldName(member.username),
-    };
-  });
-
-  const byCanon = new Map<string, MemberKeys[]>();
-  const byFold = new Map<string, MemberKeys[]>();
-  const byPrefixFold = new Map<string, MemberKeys[]>();
-  const byUsernameFold = new Map<string, MemberKeys[]>();
-  for (const k of keyed) {
-    pushMulti(byCanon, k.canon, k);
-    pushMulti(byFold, k.fold, k);
-    if (k.prefixFold) pushMulti(byPrefixFold, k.prefixFold, k);
-    if (k.usernameFold) pushMulti(byUsernameFold, k.usernameFold, k);
-  }
-
-  // The OTHER guild, indexed for reporting only (never an import target).
-  const otherGuild: Guild = guild === "daddy" ? "mummy" : "daddy";
-  const otherByCanon = new Map<string, RosterMember>();
-  const otherByFold = new Map<string, RosterMember>();
-  for (const m of otherRoster) {
-    const c = canonicalName(m.displayName);
-    const f = foldName(m.displayName);
-    if (c && !otherByCanon.has(c)) otherByCanon.set(c, m);
-    if (f && !otherByFold.has(f)) otherByFold.set(f, m);
-  }
-  const crossGuildHit = (
-    canon: string,
-    fold: string,
-  ): CrossGuildHit | null => {
-    const exact = otherByCanon.get(canon);
-    if (exact) {
-      return {
-        userId: exact.userId,
-        displayName: exact.displayName,
-        guild: otherGuild,
-        guildLabel: GUILD_LABEL[otherGuild],
-        via: "exact",
-      };
-    }
-    const folded = fold ? otherByFold.get(fold) : undefined;
-    if (folded) {
-      return {
-        userId: folded.userId,
-        displayName: folded.displayName,
-        guild: otherGuild,
-        guildLabel: GUILD_LABEL[otherGuild],
-        via: "fold",
-      };
-    }
-    return null;
-  };
-
-  // ---- pass 1: parse cells + exact matching -----------------------------
-  interface Draft extends PreviewRow {
-    canon: string;
-    fold: string;
-    prefixFold: string | null;
-  }
-
-  const drafts: Draft[] = [];
+  // ---- pass 1: parse cells; malformed rows never reach the matcher -------
+  const rows: PreviewRow[] = [];
+  const toMatch: NameEntry<number>[] = [];
   // canonical IGN -> the row number that first used it (duplicate detection).
   const seenIgn = new Map<string, number>();
-  // userIds claimed by an EXACT match; a fuzzy suggestion may not steal them.
-  const claimed = new Set<string>();
 
   dataRecords.forEach((rec, i) => {
     const rowNumber = i + 1;
     const rawName = (rec.cells[header.nameIndex] ?? "").trim();
     const rawPower = (rec.cells[header.powerIndex] ?? "").trim();
 
-    const base: Draft = {
+    const base: PreviewRow = {
       rowNumber,
       line: rec.line,
       rawName,
@@ -642,25 +438,22 @@ export function buildPreview(
       candidates: [],
       reason: null,
       crossGuild: null,
-      canon: "",
-      fold: "",
-      prefixFold: null,
     };
 
     if (rawName === "") {
-      drafts.push({ ...base, reason: "IGN is blank." });
+      rows.push({ ...base, reason: "IGN is blank." });
       return;
     }
     const power = parsePowerCell(rawPower);
     if (!power.ok) {
-      drafts.push({ ...base, reason: power.reason });
+      rows.push({ ...base, reason: power.reason });
       return;
     }
 
     const canon = canonicalName(rawName);
     const dupOf = seenIgn.get(canon);
     if (dupOf !== undefined) {
-      drafts.push({
+      rows.push({
         ...base,
         power: power.value,
         note: power.note,
@@ -670,147 +463,26 @@ export function buildPreview(
     }
     seenIgn.set(canon, rowNumber);
 
-    const prefix = prefixBeforeSeparator(rawName);
-    const draft: Draft = {
+    rows.push({
       ...base,
       power: power.value,
       note: power.note,
       tier: "unmatched",
-      canon,
-      fold: foldName(rawName),
-      prefixFold: prefix ? foldName(prefix) : null,
-    };
-
-    const hits = byCanon.get(canon);
-    if (hits && hits.length === 1) {
-      draft.tier = "exact";
-      draft.userId = hits[0].member.userId;
-      claimed.add(hits[0].member.userId);
-    } else if (hits && hits.length > 1) {
-      // Two roster members share a display name — never guess.
-      draft.tier = "suggested";
-      draft.reason = `${hits.length} members share this name — pick one.`;
-      draft.candidates = hits.map((h) => ({
-        userId: h.member.userId,
-        displayName: h.member.displayName,
-        score: 1,
-        reason: "exact name (ambiguous)",
-      }));
-    }
-    drafts.push(draft);
+    });
+    toMatch.push({ key: rowNumber, rawName });
   });
 
-  // ---- pass 2: candidates for everything not exactly matched ------------
-  for (const draft of drafts) {
-    if (draft.tier === "error" || draft.tier === "exact") continue;
-    if (draft.candidates.length > 0) continue; // ambiguous rows keep their list
-
-    const scored = new Map<string, Candidate>();
-    const offer = (k: MemberKeys, score: number, reason: string) => {
-      if (claimed.has(k.member.userId)) return; // taken by an exact match
-      const prev = scored.get(k.member.userId);
-      if (!prev || score > prev.score) {
-        scored.set(k.member.userId, {
-          userId: k.member.userId,
-          displayName: k.member.displayName,
-          score,
-          reason,
-        });
-      }
-    };
-
-    // a) aggressive fold equality — homoglyphs, diacritics, punctuation.
-    for (const k of byFold.get(draft.fold) ?? []) {
-      offer(k, 0.97, "same name after homoglyph/diacritic folding");
-    }
-    // b) the MEMBER's name carries decoration after a separator.
-    for (const k of byPrefixFold.get(draft.fold) ?? []) {
-      offer(k, 0.92, "member name has extra text after a separator");
-    }
-    // c) the CSV name carries decoration after a separator.
-    if (draft.prefixFold) {
-      for (const k of byFold.get(draft.prefixFold) ?? []) {
-        offer(k, 0.92, "CSV name has extra text after a separator");
-      }
-    }
-    // d) Discord username (membersync falls back to it when there's no nickname).
-    for (const k of byUsernameFold.get(draft.fold) ?? []) {
-      offer(k, 0.85, "matches the Discord username");
-    }
-    // e/f) containment + bigram similarity across the remaining roster.
-    for (const k of keyed) {
-      if (claimed.has(k.member.userId)) continue;
-      const a = draft.fold;
-      const b = k.fold;
-      if (!a || !b) continue;
-      if (
-        a !== b &&
-        ((a.length >= MIN_CONTAINMENT_LEN && b.indexOf(a) >= 0) ||
-          (b.length >= MIN_CONTAINMENT_LEN && a.indexOf(b) >= 0))
-      ) {
-        offer(k, 0.8, "one name contains the other");
-      }
-      // Fold-equal pairs are already offered above with a far more useful
-      // reason ("same name after homoglyph/diacritic folding"); scoring them
-      // again at dice=1.0 would just relabel them "100% similar".
-      if (a === b) continue;
-      const sim = diceSimilarity(a, b);
-      if (sim >= SUGGEST_THRESHOLD) {
-        offer(k, sim, `${Math.round(sim * 100)}% similar`);
-      }
-    }
-
-    const candidates = Array.from(scored.values()).sort((x, y) =>
-      y.score !== x.score
-        ? y.score - x.score
-        : x.displayName.localeCompare(y.displayName) ||
-          x.userId.localeCompare(y.userId),
-    );
-    draft.candidates = candidates.slice(0, MAX_CANDIDATES);
-    draft.crossGuild = crossGuildHit(draft.canon, draft.fold);
-
-    const best = draft.candidates[0];
-    // A cross-guild hit beats a merely-fuzzy in-guild candidate: an IGN that is
-    // literally another guild's member is far more likely to be exactly that
-    // than a 60%-similar name on this roster. A strong in-guild hit (fold /
-    // separator-prefix level, >= 0.9) still wins, since this IS the guild being
-    // imported.
-    const crossWins =
-      draft.crossGuild !== null && (!best || best.score < 0.9);
-
-    if (crossWins && draft.crossGuild) {
-      draft.tier = "unmatched";
-      draft.userId = null;
-      draft.reason =
-        `Matches ${draft.crossGuild.guildLabel} member "${draft.crossGuild.displayName}" — ` +
-        `not imported (you are importing ${GUILD_LABEL[guild]}).`;
-    } else if (best && best.score >= SUGGEST_THRESHOLD) {
-      draft.tier = "suggested";
-      draft.userId = best.userId;
-      draft.reason = `Not an exact name match — ${best.reason}. Confirm before applying.`;
-    } else {
-      draft.tier = "unmatched";
-      draft.userId = null;
-      draft.reason =
-        draft.candidates.length > 0
-          ? "No confident match — pick a member or skip."
-          : "No member of this guild found — pick a member or skip.";
-    }
+  // ---- pass 2: SHARED name matching --------------------------------------
+  const matches = matchNames(guild, toMatch, roster, otherRoster);
+  for (const row of rows) {
+    const m = matches.get(row.rowNumber);
+    if (!m) continue; // an error row — never matched
+    row.tier = m.tier;
+    row.userId = m.userId;
+    row.candidates = m.candidates;
+    row.reason = m.reason;
+    row.crossGuild = m.crossGuild;
   }
-
-  const rows: PreviewRow[] = drafts.map((d) => ({
-    rowNumber: d.rowNumber,
-    line: d.line,
-    rawName: d.rawName,
-    rawPower: d.rawPower,
-    power: d.power,
-    note: d.note,
-    tier: d.tier,
-    userId: d.userId,
-    candidates: d.candidates,
-    reason: d.reason,
-    crossGuild: d.crossGuild,
-  }));
 
   return {
     ok: true,

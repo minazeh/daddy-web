@@ -14,6 +14,7 @@ import {
 } from "@dnd-kit/core";
 import {
   GUILD_LABEL,
+  HEALER_CLASS,
   missingRequiredClasses,
   type Guild,
   type Member,
@@ -22,6 +23,7 @@ import {
 import {
   POLARITY_CARDS_PER_ROW,
   POLARITY_PARTY_COUNT,
+  POLARITY_RAID_COUNT,
   polarityTotalCapacity,
   type PolarityParty,
   type PolarityRaid,
@@ -38,20 +40,53 @@ import {
   updatePolarityParty,
 } from "@/lib/polarity-actions";
 import { MemberPool, POOL_ID } from "./MemberPool";
+import { RankingImportModal } from "./RankingImportModal";
 import { PartyCard } from "./PartyCard";
 import { MemberChip, type DragData } from "./MemberChip";
 import { TopNav } from "./TopNav";
 
 // The Polarity Raids builder for ONE guild. A SECOND, independent raid layout
 // that sits alongside the GvG main/sub board and shares none of its data:
-//   2 main raids   x 5 parties  — the top-power cohort (2 x 25 = 50 people)
-//   4 normal raids x 8 parties  — everyone else, split evenly (40 each)
+//   2 main raids   x 5 parties  — ranked by the IMPORTED DPS ranking
+//   4 normal raids x 5 parties  — everyone else by POWER, split evenly
+// Six raids of 25 seats each = 150 per guild. EVERY party on the board — main
+// and normal alike — is guaranteed a Priest: no party gets a second while any
+// party still lacks a first. Once every party has one and the other classes run
+// out, a surplus Priest may take an EMPTY seat rather than sit in the pool
+// while the board shows a hole (Conrad, 2026-09-20).
+//
+// "Import DPS ranking" opens the paste-in importer for the game's ranking
+// board. It writes to the web-owned `polarityDps` collection only — never to
+// `memberMeta.power`, so the leaderboard, the GvG builder and Siege are
+// untouched by it. A member with no imported row cannot enter a main raid.
 //
 // Interaction mirrors the GvG builder exactly: one DndContext, drag members
 // between the pool and any slot, swap on an occupied slot, per-slot locking,
 // party rename — every change auto-saves immediately via a server action. The
 // parent re-mounts this (key={guild}) on toggle, so no state crosses the
 // Daddy/Mummy boundary.
+
+// The 10 main parties (2 raids x 5) the DPS pass seeds one priest into each of.
+const MAIN_PARTY_TOTAL =
+  POLARITY_RAID_COUNT.main * POLARITY_PARTY_COUNT.main;
+
+// The 20 normal parties (4 raids x 5) the power pass seeds a priest into.
+const NORMAL_PARTY_TOTAL =
+  POLARITY_RAID_COUNT.normal * POLARITY_PARTY_COUNT.normal;
+
+// Every party on the board — 30 at the current shape.
+const BOARD_PARTY_TOTAL = MAIN_PARTY_TOTAL + NORMAL_PARTY_TOTAL;
+
+// The priest rule the POLARITY generator hardwires. It is deliberately NOT
+// read from `settings.requiredClasses` — that setting is empty in production
+// and shared with the GvG builder — so the live badge has to state it here too
+// or the board would silently disagree with what Generate just did.
+//
+// `min: 1` is a FLOOR, not a quota, and that is still the truth after the
+// spare-seat relaxation: the badge fires when a party has NO Priest, and stays
+// quiet when a party has two because the rule was never "exactly one", it was
+// "at least one". Nothing here needed changing — it was checked, not assumed.
+const POLARITY_REQUIRED_CLASSES = [{ className: HEALER_CLASS, min: 1 }];
 
 export function PolarityShell({
   guild,
@@ -73,6 +108,7 @@ export function PolarityShell({
   const [activeMember, setActiveMember] = useState<Member | null>(null);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [importing, setImporting] = useState(false);
   const [, startTransition] = useTransition();
 
   const sensors = useSensors(
@@ -94,19 +130,28 @@ export function PolarityShell({
   // LIVE per-party "missing required classes" — recomputed from CURRENT party
   // membership (locked OR unlocked), never a flag stored at Generate time, so a
   // manual drag clears the badge immediately. Same helper the GvG board uses.
+  //
+  // The requirement list is the UNION of whatever Settings asks for and the
+  // Priest the polarity generator hardwires, so dragging the only Priest out of
+  // a party flags it straight away even though `settings.requiredClasses` is
+  // empty.
+  const required = useMemo(() => {
+    const out = [...settings.requiredClasses];
+    if (!out.some((rc) => rc.className === HEALER_CLASS)) {
+      out.push(...POLARITY_REQUIRED_CLASSES);
+    }
+    return out;
+  }, [settings.requiredClasses]);
+
   const missingByParty = useMemo(() => {
     const m = new Map<string, string[]>();
     for (const p of parties) {
       if (p.memberIds.length === 0) continue;
-      const miss = missingRequiredClasses(
-        p,
-        membersById,
-        settings.requiredClasses,
-      );
+      const miss = missingRequiredClasses(p, membersById, required);
       if (miss.length > 0) m.set(p.partyId, miss);
     }
     return m;
-  }, [parties, membersById, settings.requiredClasses]);
+  }, [parties, membersById, required]);
 
   // Parties grouped by raid, in each raid's party order.
   const partiesByRaid = useMemo(() => {
@@ -336,11 +381,60 @@ export function PolarityShell({
       const res = await generatePolarity(guild);
       if (res.ok) {
         applyBoard(res.board);
-        if (res.unassignedCount && res.unassignedCount > 0) {
-          setNotice(
-            `${res.unassignedCount} member${res.unassignedCount === 1 ? "" : "s"} could not be placed — the roster exceeds the ${totalCapacity}-person capacity. They are left UNASSIGNED in the pool, not dropped.`,
+        // Say out loud what the DPS pass did and did not do. Silence here would
+        // hide the two things most likely to surprise: members barred from the
+        // main raids for having no imported row at all, and main parties left
+        // without a priest because the ranking had fewer than ten.
+        const lines: string[] = [];
+        const missingPriest = res.mainPartiesMissingPriest ?? [];
+        if ((res.dpsEligibleCount ?? 0) === 0) {
+          lines.push(
+            "No imported DPS rows for this guild — the two main raids could not be filled. Use “Import DPS ranking” first.",
           );
         }
+        if (res.noDpsCount && res.noDpsCount > 0) {
+          lines.push(
+            `${res.noDpsCount} member${res.noDpsCount === 1 ? " has" : "s have"} no imported DPS row, so ${res.noDpsCount === 1 ? "they were" : "they were"} not eligible for a main raid and went to the normal raids instead.`,
+          );
+        }
+        if (missingPriest.length > 0) {
+          lines.push(
+            `${missingPriest.length} main part${missingPriest.length === 1 ? "y has" : "ies have"} no Priest — the ranking had ${res.mainPriestsSeeded ?? 0} priest${(res.mainPriestsSeeded ?? 0) === 1 ? "" : "s"} for ${MAIN_PARTY_TOTAL} main parties.`,
+          );
+        }
+        const normalMissingPriest = res.normalPartiesMissingPriest ?? [];
+        if (normalMissingPriest.length > 0) {
+          lines.push(
+            `${normalMissingPriest.length} normal part${normalMissingPriest.length === 1 ? "y has" : "ies have"} no Priest — the roster ran out. They are filled with other classes and flagged, not left empty.`,
+          );
+        }
+        // A surplus priest taking a SECOND seat in a party is the one thing on
+        // this board that contradicts the headline rule, so it is said out
+        // loud rather than left for Conrad to spot in the cards.
+        const spare = res.sparePriestsSeated ?? 0;
+        if (spare > 0) {
+          lines.push(
+            `${spare} surplus Priest${spare === 1 ? "" : "s"} took an empty seat as a party's second Priest — every one of the ${BOARD_PARTY_TOTAL} parties already had its first, and the other classes ran out before the seats did.`,
+          );
+        }
+        // What is left after that really is unplaceable: every party has a
+        // priest AND the board is full. Members sitting unassigned while seats
+        // are open is no longer possible, so the wording no longer claims it.
+        const surplus = res.surplusPriestCount ?? 0;
+        if (surplus > 0) {
+          lines.push(
+            `${surplus} Priest${surplus === 1 ? "" : "s"} stayed in the pool — all ${BOARD_PARTY_TOTAL} parties have one and there was no empty seat left. Swap ${surplus === 1 ? "them" : "them"} in by hand if you want ${surplus === 1 ? "them" : "them"} on the board.`,
+          );
+        }
+        if (res.unassignedCount && res.unassignedCount > 0) {
+          const other = res.unassignedCount - surplus;
+          if (other > 0) {
+            lines.push(
+              `${other} other member${other === 1 ? "" : "s"} could not be placed against the ${totalCapacity}-person capacity. They are left UNASSIGNED in the pool, not dropped.`,
+            );
+          }
+        }
+        setNotice(lines.length > 0 ? lines.join(" ") : null);
       } else if (res.message) {
         setNotice(res.message);
       }
@@ -420,7 +514,7 @@ export function PolarityShell({
                 disabled={!persistenceEnabled || busy}
                 title={
                   persistenceEnabled
-                    ? "Auto-fill unlocked slots — top power into the 2 main raids, the rest split evenly across the 4 normal raids"
+                    ? "Auto-fill unlocked slots — the imported DPS ranking fills the 2 main raids, the rest split evenly across the 4 normal raids by power. Every party gets a Priest first; only then may a surplus Priest take a seat that would otherwise stay empty."
                     : "Needs MONGODB_URI"
                 }
                 className="rounded-md bg-gradient-to-r from-indigo-600 to-fuchsia-600 px-3 py-1.5 text-sm font-semibold text-white hover:from-indigo-500 hover:to-fuchsia-500 disabled:opacity-40"
@@ -444,6 +538,19 @@ export function PolarityShell({
                 className="rounded-md border border-red-400/40 bg-red-950/40 px-3 py-1.5 text-sm font-medium text-red-200 hover:bg-red-900/40 disabled:opacity-40"
               >
                 Reset Lock
+              </button>
+              <button
+                type="button"
+                onClick={() => setImporting(true)}
+                disabled={!persistenceEnabled || busy}
+                title={
+                  persistenceEnabled
+                    ? "Paste the game's DPS ranking board — it drives the two main raids. Preview first; nothing is saved until you apply."
+                    : "Needs MONGODB_URI"
+                }
+                className="rounded-md border border-fuchsia-400/40 bg-fuchsia-950/40 px-3 py-1.5 text-sm font-medium text-fuchsia-100 hover:bg-fuchsia-900/50 disabled:opacity-40"
+              >
+                Import DPS ranking
               </button>
 
               <span className="ml-1 rounded bg-indigo-500/15 px-2 py-1 text-xs text-indigo-200 ring-1 ring-indigo-400/30">
@@ -503,6 +610,18 @@ export function PolarityShell({
           </div>
         </div>
       </div>
+
+      {importing && (
+        <RankingImportModal
+          guild={guild}
+          onClose={() => setImporting(false)}
+          onApplied={(updated) =>
+            setNotice(
+              `Imported ${updated} DPS row${updated === 1 ? "" : "s"}. Press Generate to rebuild the two main raids from the new ranking.`,
+            )
+          }
+        />
+      )}
 
       <DragOverlay>
         {activeMember ? (
@@ -629,11 +748,11 @@ function RaidSection({
           ].join(" ")}
           title={
             isMain
-              ? "Top-power cohort — the two main raids take the highest-power members."
-              : "Normal raid — the remaining members are split evenly across the four."
+              ? "DPS ranking cohort — the two main raids take the highest imported DPS, a Priest in every party. A member with no imported row cannot be here."
+              : "Normal raid — the remaining members are split evenly across the four, ranked by power, a Priest in every party. A surplus Priest fills an empty seat only after the other classes run out."
           }
         >
-          {isMain ? "top power" : "normal"}
+          {isMain ? "top DPS" : "normal"}
         </span>
         <span className="text-xs font-normal text-slate-400">
           {parties.length} parties · {headcount}/{capacity}
