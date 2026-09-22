@@ -85,8 +85,14 @@ import {
   type PolarityKind,
 } from "../src/lib/polarity";
 import {
+  CLASS_ROLE,
   DEFAULT_SETTINGS,
   HEALER_CLASS,
+  KNOWN_CLASSES,
+  isHealer,
+  partyHasPriest,
+  roleFor,
+  roleForClass,
   type Member,
   type Settings,
 } from "../src/lib/types";
@@ -1605,6 +1611,30 @@ for (const priestCount of [37, 60, 120]) {
     `priests=${priestCount}: and the spare counts match`,
     [a.sparePriestsSeated, a.surplusPriestCount],
     [shuffled.sparePriestsSeated, shuffled.surplusPriestCount],
+  );
+}
+
+// 17. Bard / Dancer / Alchemist (Conrad, 2026-09-23): known classes, DPS by
+//     default, and NEVER counted as the party's Priest.
+console.log("\n17. new classes are DPS and never priests");
+for (const cls of ["Bard", "Dancer", "Alchemist"]) {
+  check(`${cls}: in KNOWN_CLASSES`, (KNOWN_CLASSES as readonly string[]).includes(cls), true);
+  check(`${cls}: CLASS_ROLE = dps`, CLASS_ROLE[cls], "dps");
+  check(`${cls}: roleForClass = dps`, roleForClass(cls), "dps");
+  check(`${cls}: DEFAULT_SETTINGS.classRoles = dps`, DEFAULT_SETTINGS.classRoles[cls], "dps");
+  check(`${cls}: roleFor(default settings) = dps`, roleFor(cls, DEFAULT_SETTINGS.classRoles), "dps");
+  check(`${cls}: not the healer class`, isHealer(cls), false);
+}
+{
+  const byId = new Map([
+    ["b", { className: "Bard" }],
+    ["d", { className: "Dancer" }],
+    ["a", { className: "Alchemist" }],
+  ]);
+  check(
+    "a Bard/Dancer/Alchemist party does NOT have a priest",
+    partyHasPriest({ memberIds: ["b", "d", "a"] }, byId),
+    false,
   );
 }
 
