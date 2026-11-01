@@ -1614,10 +1614,10 @@ for (const priestCount of [37, 60, 120]) {
   );
 }
 
-// 17. Bard / Dancer / Alchemist (Conrad, 2026-09-23): known classes, DPS by
+// 17. Bard / Dancer / Alchemist (Conrad, 2026-09-23) + Sage / Rogue (2026-11-01): known classes, DPS by
 //     default, and NEVER counted as the party's Priest.
 console.log("\n17. new classes are DPS and never priests");
-for (const cls of ["Bard", "Dancer", "Alchemist"]) {
+for (const cls of ["Bard", "Dancer", "Alchemist", "Sage", "Rogue"]) {
   check(`${cls}: in KNOWN_CLASSES`, (KNOWN_CLASSES as readonly string[]).includes(cls), true);
   check(`${cls}: CLASS_ROLE = dps`, CLASS_ROLE[cls], "dps");
   check(`${cls}: roleForClass = dps`, roleForClass(cls), "dps");
@@ -1630,10 +1630,12 @@ for (const cls of ["Bard", "Dancer", "Alchemist"]) {
     ["b", { className: "Bard" }],
     ["d", { className: "Dancer" }],
     ["a", { className: "Alchemist" }],
+    ["s", { className: "Sage" }],
+    ["r", { className: "Rogue" }],
   ]);
   check(
-    "a Bard/Dancer/Alchemist party does NOT have a priest",
-    partyHasPriest({ memberIds: ["b", "d", "a"] }, byId),
+    "a Bard/Dancer/Alchemist/Sage/Rogue party does NOT have a priest",
+    partyHasPriest({ memberIds: ["b", "d", "a", "s", "r"] }, byId),
     false,
   );
 }
